@@ -1,0 +1,146 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemotron-engine-config
+  namespace: ims
+data:
+  # glibc memory allocator / Python scientific thread controls
+  MALLOC_ARENA_MAX: "2"
+  MKL_NUM_THREADS: "16"
+  NUMEXPR_NUM_THREADS: "16"
+  OMP_NUM_THREADS: "16"
+  OPENBLAS_NUM_THREADS: "16"
+  TOKENIZERS_PARALLELISM: "false"
+
+  # ── CPU-only mode ──────────────────────────────────────────────────
+  #
+  #   ASR         →  CPU  (PyTorch)            — 2 workers
+  #   Translation →  CPU  (CTranslate2 int8)   — 2 workers
+  #   TTS         →  CPU  (Piper/ONNX Runtime) — 2 workers
+  #
+  # Dùng cho môi trường dev / staging không có GPU,
+  # hoặc khi GPU không khả dụng. Hiệu năng thấp hơn GPU mode.
+  # Không cần torch+cu124 hay onnxruntime-gpu.
+
+  # ── Startup timeout ────────────────────────────────────────────────
+  MODEL_LOADING_TIMEOUT_S: "600"     # CPU load chậm hơn GPU; 10 phút đủ cho 2 workers
+
+  # ── Nemotron ASR  (CPU) ────────────────────────────────────────────
+  MODEL_PATH: /app/models/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo
+  ASR_WORKERS: "2"
+  ASR_DEVICE: cpu
+  ASR_DEVICES: "cpu"
+  ASR_LANGUAGE: vi-VN
+  ASR_BEAM_SIZE: "1"                 # greedy trên CPU — beam search quá chậm
+  MODEL_LEFT_CONTEXT: "56"
+  MODEL_LOOKAHEAD_TOKENS: "6"        # 560ms chunk
+  WARMUP_SECONDS: "3.0"
+  RUNTIME_QUEUE_SIZE: "128"
+
+  # CPU thread pools — tăng tối đa cho ASR inference
+  CPU_THREADS: "16"
+  CPU_INTEROP_THREADS: "4"
+
+  CUDA_MEMORY_FRACTION: "0"          # disabled (không có GPU)
+
+  # ── gRPC / metrics ─────────────────────────────────────────────────
+  GRPC_SERVER_ADDRESS: "0.0.0.0:50052"
+  METRICS_PORT: "8001"
+  MAX_RPC_MESSAGE_MB: "8"
+  RESPONSE_QUEUE_SIZE: "128"
+  RESULT_QUEUE_MAXSIZE: "512"
+  GRPC_KEEPALIVE_TIME_MS: "30000"
+  GRPC_KEEPALIVE_TIMEOUT_MS: "10000"
+  GRPC_STOP_GRACE_S: "5.0"
+  SHUTDOWN_TIMEOUT_S: "30.0"
+  STATS_LOG_INTERVAL_S: "10"
+  GPU_MONITOR_INTERVAL_S: "0"        # disabled — không có GPU
+
+  # ── Logging ────────────────────────────────────────────────────────
+  LOG_LEVEL: INFO
+  CONSOLE_LOG_LEVEL: ERROR
+  THIRD_PARTY_LOG_LEVEL: ERROR
+  LOG_FILE: /app/logs/nemotron-engine.log
+  LOG_MAX_BYTES: "104857600"
+  LOG_BACKUP_COUNT: "10"
+  SUPPRESS_MODEL_INIT_OUTPUT: "true"
+
+  # ── VAD / endpointing ──────────────────────────────────────────────
+  VAD_ENABLED: "true"
+  VAD_BACKEND: silero
+  VAD_THRESHOLD: "0.5"
+  VAD_DEVICE: cpu
+  VAD_MIN_SPEECH_MS: "250"
+  VAD_END_SILENCE_MS: "600"          # dài hơn GPU để giảm tải CPU
+  VAD_PRE_ROLL_MS: "100"
+  MAX_UTTERANCE_MS: "20000"
+
+  # ── Backpressure / Admission control ───────────────────────────────
+  MAX_INGRESS_AUDIO_MS: "60000"      # giảm xuống vì CPU chậm hơn
+  MAX_POSTPROCESS_PENDING_PER_RPC: "4"
+  MAX_CONCURRENT_RPCS: "0"
+  MAX_CONCURRENT_UTTERANCES: "0"
+  RPC_MAX_IDLE_S: "300"
+
+  # ── RTP continuity ─────────────────────────────────────────────────
+  RTP_GAP_POLICY: insert_silence
+  RTP_MAX_GAP_MS: "200"
+  RTP_OUT_OF_ORDER_POLICY: drop
+  RTP_JITTER_TOLERANCE_MS: "20"
+
+  # ── EnViT5 Translation  (CPU) ─────────────────────────────────────
+  TRANSLATION_ENABLED: "true"
+  TRANSLATION_MODEL_PATH: /app/models/envit5_ctranslate2
+  TRANSLATION_TOKENIZER_PATH: /app/models/envit5_ctranslate2
+  TRANSLATION_WORKERS: "2"
+  TRANSLATION_DEVICE: cpu
+  TRANSLATION_DEVICES: "cpu"
+  TRANSLATION_COMPUTE_TYPE: int8     # int8 tối ưu cho CPU AVX2/AVX-512
+  TRANSLATION_INTER_THREADS: "2"     # song song hoá giữa các request
+  TRANSLATION_INTRA_THREADS: "8"     # intra-op threads cho từng request
+  TRANSLATION_QUEUE_SIZE: "64"
+  TRANSLATION_BEAM_SIZE: "1"         # greedy trên CPU — beam=4 quá chậm
+  TRANSLATION_MAX_DECODING_LENGTH: "256"
+  TRANSLATION_BATCH_SIZE: "8"
+  TRANSLATION_BATCH_WAIT_MS: "10"    # wait lâu hơn để batch nhiều hơn trên CPU
+  TRANSLATION_VI_PREFIX: "vi:"
+  TRANSLATION_EN_PREFIX: "en:"
+  TRANSLATE_VI_TARGET: en-US
+  TRANSLATE_EN_TARGET: vi-VN
+  TRANSLATE_EMIT_SOURCE_PARTIALS: "false"
+
+  # ── TTS  (CPU) ────────────────────────────────────────────────────
+  # TTS_BACKEND=piper  → Piper/ONNX, CPU-friendly, RTF ~0.3–0.8 trên CPU
+  # TTS_BACKEND=magpie → NeMo MagpieTTS, RTF >> 1 trên CPU (không real-time)
+  #                      Chỉ dùng magpie cho dev/test, không phù hợp production CPU.
+  TTS_ENABLED: "true"
+  TTS_BACKEND: "piper"
+  TTS_WORKERS: "2"
+  TTS_DEVICE: cpu
+  TTS_DEVICES: "cpu"
+  TTS_OUTPUT_PT: "0"                 # 0=PCMU | 8=PCMA
+  TTS_TARGET_SAMPLE_RATE: "8000"
+  TTS_MAX_TEXT_CHARS: "2000"
+  TTS_LENGTH_SCALE: "1.0"
+  TTS_NOISE_SCALE: "0.667"
+  TTS_NOISE_W_SCALE: "0.8"
+  TTS_VOLUME: "1.0"
+  TTS_INTRA_THREADS: "8"             # nhiều threads hơn vì không có GPU
+  TTS_QUEUE_SIZE: "32"
+
+  # ── Piper TTS backend ─────────────────────────────────────────────
+  TTS_EN_MODEL_PATH: /app/models/piper/en_US-lessac-medium.onnx
+  TTS_EN_CONFIG_PATH: /app/models/piper/en_US-lessac-medium.onnx.json
+  TTS_VI_MODEL_PATH: /app/models/piper/vi_VN-vais1000-medium.onnx
+  TTS_VI_CONFIG_PATH: /app/models/piper/vi_VN-vais1000-medium.onnx.json
+
+  # ── Magpie TTS backend (khi TTS_BACKEND=magpie) ───────────────────
+  # Cảnh báo: trên CPU không real-time. Dùng cho dev/test chất lượng giọng.
+  # Codec -offline.nemo bao gồm sub-dependencies → không cần internet (air-gapped).
+  TTS_MAGPIE_MODEL_PATH: /app/models/magpie_tts/magpie_tts_multilingual_357m.nemo
+  TTS_MAGPIE_CODEC_MODEL_PATH: /app/models/magpie_tts/nemo-nano-codec-22khz-1.89kbps-21.5fps/nemo-nano-codec-22khz-1.89kbps-21.5fps-offline.nemo
+  TTS_SPEAKER_INDEX: "0"             # 0=Aria 1=Jason 2=John 3=Leo 4=Sofia
+  TTS_CFG_SCALE: "2.5"
+  TTS_TEMPERATURE: "0.6"
+  TTS_TOP_K: "80"
+  TTS_MAGPIE_APPLY_TN: "false"       # true = text normalisation trước synthesis

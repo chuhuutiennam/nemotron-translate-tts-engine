@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemotron-engine-config
+  namespace: ims
+data:
+  # glibc memory allocator / Python scientific thread controls
+  MALLOC_ARENA_MAX: "2"
+  MKL_NUM_THREADS: "8"
+  NUMEXPR_NUM_THREADS: "8"
+  OMP_NUM_THREADS: "8"
+  OPENBLAS_NUM_THREADS: "8"
+  TOKENIZERS_PARALLELISM: "false"
+
+  # ── GPU layout (4x A30 24 GB) ──────────────────────────────────────
+  #
+  #   GPU 0, 1  →  ASR  (Nemotron / PyTorch)        — 2 workers/GPU  ~2.4 GB
+  #   GPU 2, 3  →  Translation (CTranslate2)        — 2 workers/GPU  ~0.8 GB
+  #               + TTS  (Magpie NeMo multilingual) — 1 worker/GPU   ~0.7 GB
+  #                                                    total          ~1.5 GB / 24 GB
+  #
+  # Workload-level isolation: PyTorch (ASR) và CTranslate2 (Translation)
+  # không dùng chung GPU. TTS co-locate với Translation trên GPU 2–3.
+  # CUDA_MEMORY_FRACTION chỉ áp dụng cho PyTorch trên GPU 0–1.
+  # Yêu cầu: torch+cu124, nemo_toolkit trong container image.
+
+  # ── Startup timeout ────────────────────────────────────────────────
+  # 4 ASR + 4 Translation + 2 TTS (Magpie) workers load đồng thời; 30 phút đủ dư.
+  MODEL_LOADING_TIMEOUT_S: "1800"
+
+  # ── Nemotron ASR  (GPU 0, 1) ───────────────────────────────────────
+  MODEL_PATH: /app/models/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo
+  ASR_WORKERS: "4"                   # 2 workers / GPU  (worker 0,2 → cuda:0 ; 1,3 → cuda:1)
+  ASR_DEVICE: "cuda:0"               # fallback khi ASR_DEVICES không set
+  ASR_DEVICES: "cuda:0,cuda:1"       # ASR độc quyền GPU 0–1
+  ASR_LANGUAGE: vi-VN
+  ASR_BEAM_SIZE: "1"                 # beam search không tương thích với NeMo streaming conformer_stream_step
+  MODEL_LEFT_CONTEXT: "56"
+  MODEL_LOOKAHEAD_TOKENS: "6"        # 560ms chunk
+  WARMUP_SECONDS: "3.0"
+  RUNTIME_QUEUE_SIZE: "512"
+
+  # CPU (PyTorch preprocessing / BLAS thread pools)
+  CPU_THREADS: "8"
+  CPU_INTEROP_THREADS: "2"
+
+  # GPU memory cap — PyTorch trên GPU 0–1 dùng tối đa 90% VRAM (~21.6 GB)
+  CUDA_MEMORY_FRACTION: "0.90"
+
+  # ── gRPC / metrics ─────────────────────────────────────────────────
+  GRPC_SERVER_ADDRESS: "0.0.0.0:50052"
+  METRICS_PORT: "8001"
+  MAX_RPC_MESSAGE_MB: "8"
+  RESPONSE_QUEUE_SIZE: "256"
+  RESULT_QUEUE_MAXSIZE: "1024"
+  GRPC_KEEPALIVE_TIME_MS: "30000"
+  GRPC_KEEPALIVE_TIMEOUT_MS: "10000"
+  GRPC_STOP_GRACE_S: "5.0"
+  SHUTDOWN_TIMEOUT_S: "30.0"
+  STATS_LOG_INTERVAL_S: "10"
+  GPU_MONITOR_INTERVAL_S: "5"
+
+  # ── Logging ────────────────────────────────────────────────────────
+  LOG_LEVEL: INFO
+  CONSOLE_LOG_LEVEL: ERROR
+  THIRD_PARTY_LOG_LEVEL: ERROR
+  LOG_FILE: /app/logs/nemotron-engine.log
+  LOG_MAX_BYTES: "104857600"
+  LOG_BACKUP_COUNT: "10"
+  SUPPRESS_MODEL_INIT_OUTPUT: "true"
+
+  # ── VAD / endpointing ──────────────────────────────────────────────
+  VAD_ENABLED: "true"
+  VAD_BACKEND: silero
+  VAD_THRESHOLD: "0.5"
+  VAD_DEVICE: cpu
+  VAD_MIN_SPEECH_MS: "250"
+  VAD_END_SILENCE_MS: "400"
+  VAD_PRE_ROLL_MS: "150"
+  MAX_UTTERANCE_MS: "20000"
+
+  # ── Backpressure / Admission control ───────────────────────────────
+  MAX_INGRESS_AUDIO_MS: "120000"
+  MAX_POSTPROCESS_PENDING_PER_RPC: "8"
+  MAX_CONCURRENT_RPCS: "0"        # 0 = unlimited — tune sau load test
+  MAX_CONCURRENT_UTTERANCES: "0"  # 0 = unlimited — tune sau load test
+  RPC_MAX_IDLE_S: "300"
+
+  # ── RTP continuity ─────────────────────────────────────────────────
+  RTP_GAP_POLICY: insert_silence
+  RTP_MAX_GAP_MS: "200"
+  RTP_OUT_OF_ORDER_POLICY: drop
+  RTP_JITTER_TOLERANCE_MS: "20"
+
+  # ── EnViT5 Translation  (GPU 2, 3) ─────────────────────────────────
+  TRANSLATION_ENABLED: "true"
+  TRANSLATION_MODEL_PATH: /app/models/envit5_ctranslate2
+  TRANSLATION_TOKENIZER_PATH: /app/models/envit5_ctranslate2
+  TRANSLATION_WORKERS: "4"          # 2 workers / GPU  (worker 0,2 → cuda:2 ; 1,3 → cuda:3)
+  TRANSLATION_DEVICE: "cuda:2"      # fallback
+  TRANSLATION_DEVICES: "cuda:2,cuda:3"
+  TRANSLATION_COMPUTE_TYPE: int8_float16  # Ampere Tensor Core tối ưu
+  TRANSLATION_INTER_THREADS: "1"
+  TRANSLATION_INTRA_THREADS: "4"
+  TRANSLATION_QUEUE_SIZE: "128"
+  TRANSLATION_BEAM_SIZE: "4"
+  TRANSLATION_MAX_DECODING_LENGTH: "384"
+  TRANSLATION_BATCH_SIZE: "16"
+  TRANSLATION_BATCH_WAIT_MS: "5"
+  TRANSLATION_VI_PREFIX: "vi:"
+  TRANSLATION_EN_PREFIX: "en:"
+  TRANSLATE_VI_TARGET: en-US
+  TRANSLATE_EN_TARGET: vi-VN
+  TRANSLATE_EMIT_SOURCE_PARTIALS: "false"
+
+  # ── TTS  (GPU 2, 3 — co-locate với Translation) ────────────────────
+  # TTS_BACKEND=magpie → NeMo MagpieTTS multilingual (1 checkpoint EN + VI)
+  # TTS_BACKEND=piper  → Piper/ONNX (model EN + VI riêng, cần TTS_*_MODEL_PATH)
+  TTS_ENABLED: "true"
+  TTS_BACKEND: "magpie"
+  TTS_WORKERS: "2"                   # Magpie: 1 worker / GPU  (worker 0 → cuda:2 ; 1 → cuda:3)
+  TTS_DEVICE: "cuda:2"               # fallback
+  TTS_DEVICES: "cuda:2,cuda:3"
+  TTS_OUTPUT_PT: "0"                 # 0=PCMU | 8=PCMA
+  TTS_TARGET_SAMPLE_RATE: "8000"
+  TTS_MAX_TEXT_CHARS: "2000"
+  TTS_LENGTH_SCALE: "1.0"
+  TTS_NOISE_SCALE: "0.667"
+  TTS_NOISE_W_SCALE: "0.8"
+  TTS_VOLUME: "1.0"
+  TTS_INTRA_THREADS: "4"
+  TTS_QUEUE_SIZE: "64"
+
+  # ── Magpie TTS backend ─────────────────────────────────────────────
+  # 1 NeMo checkpoint multilingual cho cả EN + VI, mỗi worker ~700 MB VRAM.
+  # Codec -offline.nemo bao gồm sub-dependencies → không cần internet (air-gapped K8s).
+  TTS_MAGPIE_MODEL_PATH: /app/models/magpie_tts/magpie_tts_multilingual_357m.nemo
+  TTS_MAGPIE_CODEC_MODEL_PATH: /app/models/magpie_tts/nemo-nano-codec-22khz-1.89kbps-21.5fps/nemo-nano-codec-22khz-1.89kbps-21.5fps-offline.nemo
+  TTS_SPEAKER_INDEX: "0"             # 0=Aria 1=Jason 2=John 3=Leo 4=Sofia
+  TTS_CFG_SCALE: "2.5"
+  TTS_TEMPERATURE: "0.6"
+  TTS_TOP_K: "80"
+  TTS_MAGPIE_APPLY_TN: "false"       # true = text normalisation trước synthesis (số, viết tắt)
+
+  # ── Piper TTS backend (khi TTS_BACKEND=piper) ─────────────────────
+  # Chỉ dùng khi cần switch về Piper. Giữ lại để fallback.
+  TTS_EN_MODEL_PATH: /app/models/piper/en_US-lessac-medium.onnx
+  TTS_EN_CONFIG_PATH: /app/models/piper/en_US-lessac-medium.onnx.json
+  TTS_VI_MODEL_PATH: /app/models/piper/vi_VN-vais1000-medium.onnx
+  TTS_VI_CONFIG_PATH: /app/models/piper/vi_VN-vais1000-medium.onnx.json

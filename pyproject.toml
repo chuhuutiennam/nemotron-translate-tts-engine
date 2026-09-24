@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemotron-translate-tts-engine"
+version = "0.3.2"
+description = "Thread-safe gRPC streaming ASR + EnViT5 translation + Piper TTS engine"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26",
+  "protobuf~=5.29.5",
+  "grpcio>=1.67",
+  "prometheus-client>=0.21",
+  "omegaconf>=2.3",
+  "soxr>=0.5",
+  "soundfile>=0.12",
+  "ctranslate2>=4.5",
+  "transformers>=4.45",
+  "sentencepiece>=0.2",
+  "piper-tts>=1.3",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+nemotron-asr-server = "nemotron_testbed.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
