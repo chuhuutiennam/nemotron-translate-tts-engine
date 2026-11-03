@@ -31,6 +31,7 @@ data:
   ASR_DEVICE: cpu
   ASR_DEVICES: "cpu"
   ASR_LANGUAGE: vi-VN
+  ASR_USE_LANGUAGE_SOURCE: "true"    # dùng AudioChunk.language_source (nếu rtpgw gửi) làm ngôn ngữ nguồn; rỗng -> auto
   ASR_BEAM_SIZE: "1"                 # greedy trên CPU — beam search quá chậm
   MODEL_LEFT_CONTEXT: "56"
   MODEL_LOOKAHEAD_TOKENS: "6"        # 560ms chunk
@@ -49,8 +50,11 @@ data:
   MAX_RPC_MESSAGE_MB: "8"
   RESPONSE_QUEUE_SIZE: "128"
   RESULT_QUEUE_MAXSIZE: "512"
-  GRPC_KEEPALIVE_TIME_MS: "30000"
-  GRPC_KEEPALIVE_TIMEOUT_MS: "10000"
+  GRPC_KEEPALIVE_TIME_MS: "60000"
+  GRPC_KEEPALIVE_TIMEOUT_MS: "20000"
+  GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS: "true"
+  GRPC_MIN_PING_INTERVAL_WITHOUT_DATA_MS: "60000"
+  GRPC_MAX_PING_STRIKES: "2"
   GRPC_STOP_GRACE_S: "5.0"
   SHUTDOWN_TIMEOUT_S: "30.0"
   STATS_LOG_INTERVAL_S: "10"
@@ -61,23 +65,43 @@ data:
   CONSOLE_LOG_LEVEL: ERROR
   THIRD_PARTY_LOG_LEVEL: ERROR
   LOG_FILE: /app/logs/nemotron-engine.log
-  LOG_MAX_BYTES: "104857600"
   LOG_BACKUP_COUNT: "10"
   SUPPRESS_MODEL_INIT_OUTPUT: "true"
+  # trace_pcap (docs/trace-pcap-design.md): pcap of the audio received and after AudX; off, needs a restart
+  TRACE_PCAP_ENABLED: "false"
+  TRACE_PCAP_DIR: /app/logs/pcap
+  TRACE_PCAP_MAX_STREAMS: "0"
+  TRACE_PCAP_MAX_SECONDS: "0"
+  TRACE_PCAP_MIN_FREE_MB: "5120"
 
   # ── VAD / endpointing ──────────────────────────────────────────────
   VAD_ENABLED: "true"
   VAD_BACKEND: silero
   VAD_THRESHOLD: "0.5"
+  # VAD_NEG_THRESHOLD unset → max(VAD_THRESHOLD - 0.15, 0.01) (hysteresis như Silero VADIterator; = VAD_THRESHOLD để tắt)
   VAD_DEVICE: cpu
   VAD_MIN_SPEECH_MS: "250"
   VAD_END_SILENCE_MS: "600"          # dài hơn GPU để giảm tải CPU
   VAD_PRE_ROLL_MS: "100"
+  VAD_NO_START_WARN_MS: "5000"       # cảnh báo khi stream nhận ngần này audio mà VAD chưa START; 0 = tắt
   MAX_UTTERANCE_MS: "20000"
+
+  # ── Sentence segmentation ──────────────────────────────────────────
+  SEGMENTATION_MODE: "on"            # off | shadow | on (shadow chỉ ghi log; on = dịch + TTS + phát từng câu, chỉ bật sau khi có số liệu shadow)
+  SEGMENTATION_STABLE_N: "2"
+  SEGMENTATION_STABLE_MS: "0"        # 0 = tắt
+  SEGMENTATION_PUNCT_STABLE_N: "1"  # dấu mạnh . ? !: số bước model câu phải giữ nguyên (bỏ key = dùng STABLE_N); STABLE_N/MS chỉ còn áp cho cắt tại dấu phẩy
+  SEGMENTATION_PUNCT_STABLE_MS: "0"  # dấu mạnh . ? !: hoặc giữ nguyên >= ngần này ms; 0 = tắt (bỏ key = dùng STABLE_MS)
+  SEGMENTATION_MIN_TOKENS: "6"
+  SEGMENTATION_MAX_SEGMENT_MS: "8000"  # 0 = tắt
+  SEGMENTATION_COMMA_AFTER_MS: "0"   # 0 = tắt
+  SEGMENTATION_SPEECH_TO_TEXT: "true"  # true = áp dụng segment cho speech_to_text (mode on: is_final theo từng câu; shadow: chỉ log)
+  SEGMENTATION_STT_PUNCT_STABLE_N: "2"  # như PUNCT_STABLE_N nhưng riêng cho speech_to_text (bỏ key = dùng PUNCT_STABLE_N)
+  SEGMENTATION_STT_PUNCT_STABLE_MS: "0"  # như PUNCT_STABLE_MS nhưng riêng cho speech_to_text; 0 = tắt
 
   # ── Backpressure / Admission control ───────────────────────────────
   MAX_INGRESS_AUDIO_MS: "60000"      # giảm xuống vì CPU chậm hơn
-  MAX_POSTPROCESS_PENDING_PER_RPC: "4"
+  MAX_POSTPROCESS_PENDING_PER_RPC: "16"  # đếm theo segment khi SEGMENTATION_MODE=on (nên >= 16)
   MAX_CONCURRENT_RPCS: "0"
   MAX_CONCURRENT_UTTERANCES: "0"
   RPC_MAX_IDLE_S: "300"
@@ -87,6 +111,40 @@ data:
   RTP_MAX_GAP_MS: "200"
   RTP_OUT_OF_ORDER_POLICY: drop
   RTP_JITTER_TOLERANCE_MS: "20"
+
+  # ── Audio pre-processing (resemble-enhance) ────────────────────────
+  # Giữ TẮT trên CPU: cửa sổ 2 s mất ~0.7 s CPU với hop 0.5 s (RTF ~1.4), không kịp realtime.
+  AUDIO_PREPROCESSING_ENABLED: "false"
+  AUDIO_PREPROCESSING_MODEL: resemble  # resemble | audx (chỉ chạy một; mỗi model có window riêng, đổi model không phải sửa số nào)
+  AUDIO_PREPROCESSING_MODE: denoiser   # resemble.mode: denoiser | enhancer (enhancer D ~4-5 s); AudX chọn bằng MODEL
+  AUDIO_PREPROCESSING_SAMPLE_PERCENT: "100"
+  AUDIO_PREPROCESSING_ASSETS_DIR: /app/models/resemble-enhance
+  AUDIO_PREPROCESSING_DEVICES: "cpu"
+  AUDIO_PREPROCESSING_WORKERS: "1"
+  AUDIO_PREPROCESSING_QUEUE_MAX: "64"
+  AUDIO_PREPROCESSING_MAX_STREAMS: "0"
+  AUDIO_PREPROCESSING_LEFT_CONTEXT_MS: "0"  # resemble.window; 0 = mặc định theo mode
+  AUDIO_PREPROCESSING_HOP_MS: "0"
+  AUDIO_PREPROCESSING_RIGHT_CONTEXT_MS: "0"
+  AUDIO_PREPROCESSING_CROSSFADE_MS: "40"
+  AUDIO_PREPROCESSING_COMPUTE_BUDGET_MS: "0"
+  AUDIO_PREPROCESSING_ENHANCER_NFE: "32"
+  AUDIO_PREPROCESSING_ENHANCER_LAMBD: "1.0"
+  AUDIO_PREPROCESSING_ENHANCER_TAU: "0.5"
+  AUDIO_PREPROCESSING_ENHANCER_ALIGN_REGIONS: "true"
+  AUDIO_PREPROCESSING_ENHANCER_ALIGN_MAX_MS: "40"
+  AUDIO_PREPROCESSING_DITHER_SIGMA_LSB: "3.0"
+  AUDIO_PREPROCESSING_DITHER_MIN_ZERO_RUN: "64"
+  AUDIO_PREPROCESSING_DITHER_SEED: "0"
+  AUDIO_PREPROCESSING_VAD_INPUT: enhanced
+  AUDIO_PREPROCESSING_FALLBACK_BAD_REGIONS: "3"
+  AUDIO_PREPROCESSING_FALLBACK_BYPASS_S: "10"
+  AUDIO_PREPROCESSING_AUDX_CHECKPOINT: /app/models/audx/audx_weights_safe.pth  # chỉ dùng khi MODEL=audx
+  AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS: "-28"
+  AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB: "30"  # 0 = tắt AGC
+  AUDIO_PREPROCESSING_AUDX_HOP_MS: "80"  # audx.window (không có left/right); bội số 16 ms
+  AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS: "10"  # < AUDX_COMPUTE_BUDGET_MS
+  AUDIO_PREPROCESSING_AUDX_COMPUTE_BUDGET_MS: "100"  # D = 80 + 64 + 100 = 244 ms
 
   # ── EnViT5 Translation  (CPU) ─────────────────────────────────────
   TRANSLATION_ENABLED: "true"
@@ -105,8 +163,6 @@ data:
   TRANSLATION_BATCH_WAIT_MS: "10"    # wait lâu hơn để batch nhiều hơn trên CPU
   TRANSLATION_VI_PREFIX: "vi:"
   TRANSLATION_EN_PREFIX: "en:"
-  TRANSLATE_VI_TARGET: en-US
-  TRANSLATE_EN_TARGET: vi-VN
   TRANSLATE_EMIT_SOURCE_PARTIALS: "false"
 
   # ── TTS  (CPU) ────────────────────────────────────────────────────

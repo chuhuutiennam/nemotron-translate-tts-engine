@@ -5,9 +5,9 @@
 #   SRC_DIR  = /u01/ims/namcht/nemotron_translate_tts_engine_v0.3.3  (source/scripts)
 #   APP_DIR  = /u01/ims/ai-engine  (etc/, models/, logs/ — runtime data)
 #
-# GPU layout:
-#   GPU 0, 1  → ASR  (Nemotron / PyTorch)           ~2.4 GB / GPU
-#   GPU 2, 3  → Translation (CTranslate2) + TTS     ~1.6 GB / GPU
+# GPU layout (2× NVIDIA L4, 23 GB each):
+#   GPU 0  → ASR  (Nemotron / PyTorch)              ~4.8 GB (2 workers)
+#   GPU 1  → Translation (CTranslate2) + TTS        ~3–4 GB (2+2 workers)
 #
 # Config priority (first match wins):
 #   1. ENGINE_CONFIG_FILE env var (explicit override)
@@ -33,13 +33,26 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# cuDNN — ORT ships its own libcudnn; must precede system libcudnn so
-# the dynamic linker picks up the correct symbols.
+# NVIDIA wheels expose shared libraries under site-packages/nvidia/*/lib.
+# LD_LIBRARY_PATH must include all of them so the dynamic linker finds
+# libcudnn, libcudart, libcublas, etc. at runtime. cudnn must come first
+# so ORT's bundled libcudnn takes precedence over any system libcudnn.
 # ---------------------------------------------------------------------------
-CUDNN_LIB="$VENV_DIR/lib/python3.12/site-packages/nvidia/cudnn/lib"
-if [[ -d "$CUDNN_LIB" ]]; then
-  export LD_LIBRARY_PATH="$CUDNN_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+_NVIDIA_SITE="$VENV_DIR/lib/python3.12/site-packages/nvidia"
+_NVIDIA_LIBS=""
+for _lib_dir in \
+    "$_NVIDIA_SITE/cudnn/lib" \
+    "$_NVIDIA_SITE/cuda_runtime/lib" \
+    "$_NVIDIA_SITE/cublas/lib" \
+    "$_NVIDIA_SITE/curand/lib" \
+    "$_NVIDIA_SITE/cufft/lib" \
+    "$_NVIDIA_SITE/cuda_nvrtc/lib"; do
+  [[ -d "$_lib_dir" ]] && _NVIDIA_LIBS="${_NVIDIA_LIBS:+$_NVIDIA_LIBS:}$_lib_dir"
+done
+if [[ -n "$_NVIDIA_LIBS" ]]; then
+  export LD_LIBRARY_PATH="${_NVIDIA_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+unset _NVIDIA_SITE _NVIDIA_LIBS _lib_dir
 
 # ---------------------------------------------------------------------------
 # Model paths — default to $APP_DIR/models/; override via env
@@ -76,13 +89,21 @@ export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-/tmp/numba_cache}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/xdg_cache}"
 
+# HuggingFace offline mode — Magpie TTS deps (WavLM, ByT5).
+# Chạy scripts/setup-magpie-cache.sh một lần trước khi dùng tts.backend: magpie.
+# Override: HF_HUB_OFFLINE=0 bash run-gpu-server.sh  (cho phép download khi cần)
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$APP_DIR/models/hf_cache}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
 # ---------------------------------------------------------------------------
 # ASR (Nemotron / PyTorch) — GPU 0, 1
 # ---------------------------------------------------------------------------
 export ASR_LANGUAGE="${ASR_LANGUAGE:-vi-VN}"
-export ASR_WORKERS="${ASR_WORKERS:-4}"          # 2 workers / GPU
+export ASR_USE_LANGUAGE_SOURCE="${ASR_USE_LANGUAGE_SOURCE:-true}"
+export ASR_WORKERS="${ASR_WORKERS:-2}"
 export ASR_DEVICE="${ASR_DEVICE:-cuda:0}"
-export ASR_DEVICES="${ASR_DEVICES:-cuda:0,cuda:1}"
+export ASR_DEVICES="${ASR_DEVICES:-cuda:0}"
 export MODEL_LEFT_CONTEXT="${MODEL_LEFT_CONTEXT:-56}"
 export MODEL_LOOKAHEAD_TOKENS="${MODEL_LOOKAHEAD_TOKENS:-6}"
 export WARMUP_SECONDS="${WARMUP_SECONDS:-3.0}"
@@ -99,8 +120,11 @@ export METRICS_PORT="${METRICS_PORT:-8001}"
 export MAX_RPC_MESSAGE_MB="${MAX_RPC_MESSAGE_MB:-8}"
 export RESPONSE_QUEUE_SIZE="${RESPONSE_QUEUE_SIZE:-256}"
 export RESULT_QUEUE_MAXSIZE="${RESULT_QUEUE_MAXSIZE:-1024}"
-export GRPC_KEEPALIVE_TIME_MS="${GRPC_KEEPALIVE_TIME_MS:-30000}"
-export GRPC_KEEPALIVE_TIMEOUT_MS="${GRPC_KEEPALIVE_TIMEOUT_MS:-10000}"
+export GRPC_KEEPALIVE_TIME_MS="${GRPC_KEEPALIVE_TIME_MS:-60000}"
+export GRPC_KEEPALIVE_TIMEOUT_MS="${GRPC_KEEPALIVE_TIMEOUT_MS:-20000}"
+export GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS="${GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS:-true}"
+export GRPC_MIN_PING_INTERVAL_WITHOUT_DATA_MS="${GRPC_MIN_PING_INTERVAL_WITHOUT_DATA_MS:-60000}"
+export GRPC_MAX_PING_STRIKES="${GRPC_MAX_PING_STRIKES:-2}"
 export GRPC_STOP_GRACE_S="${GRPC_STOP_GRACE_S:-5.0}"
 export SHUTDOWN_TIMEOUT_S="${SHUTDOWN_TIMEOUT_S:-30.0}"
 export STATS_LOG_INTERVAL_S="${STATS_LOG_INTERVAL_S:-10}"
@@ -113,7 +137,6 @@ export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export CONSOLE_LOG_LEVEL="${CONSOLE_LOG_LEVEL:-ERROR}"
 export THIRD_PARTY_LOG_LEVEL="${THIRD_PARTY_LOG_LEVEL:-ERROR}"
 export LOG_FILE="${LOG_FILE:-$LOG_DIR/nemotron-engine.log}"
-export LOG_MAX_BYTES="${LOG_MAX_BYTES:-104857600}"   # 100 MB
 export LOG_BACKUP_COUNT="${LOG_BACKUP_COUNT:-10}"
 export SUPPRESS_MODEL_INIT_OUTPUT="${SUPPRESS_MODEL_INIT_OUTPUT:-true}"
 
@@ -130,6 +153,7 @@ export VAD_ENERGY_DB_THRESHOLD="${VAD_ENERGY_DB_THRESHOLD:--42}"
 export VAD_MIN_SPEECH_MS="${VAD_MIN_SPEECH_MS:-250}"
 export VAD_END_SILENCE_MS="${VAD_END_SILENCE_MS:-600}"
 export VAD_PRE_ROLL_MS="${VAD_PRE_ROLL_MS:-100}"
+export VAD_NO_START_WARN_MS="${VAD_NO_START_WARN_MS:-5000}"
 export MAX_UTTERANCE_MS="${MAX_UTTERANCE_MS:-20000}"
 
 # ---------------------------------------------------------------------------
@@ -149,12 +173,12 @@ export RTP_OUT_OF_ORDER_POLICY="${RTP_OUT_OF_ORDER_POLICY:-drop}"
 export RTP_JITTER_TOLERANCE_MS="${RTP_JITTER_TOLERANCE_MS:-20}"
 
 # ---------------------------------------------------------------------------
-# Translation (NLLB / CTranslate2) — GPU 2, 3
+# Translation (EnViT5 / CTranslate2) — GPU 2, 3
 # ---------------------------------------------------------------------------
 export TRANSLATION_ENABLED="${TRANSLATION_ENABLED:-true}"
-export TRANSLATION_WORKERS="${TRANSLATION_WORKERS:-4}"         # 2 workers / GPU
-export TRANSLATION_DEVICE="${TRANSLATION_DEVICE:-cuda:2}"
-export TRANSLATION_DEVICES="${TRANSLATION_DEVICES:-cuda:2,cuda:3}"
+export TRANSLATION_WORKERS="${TRANSLATION_WORKERS:-2}"
+export TRANSLATION_DEVICE="${TRANSLATION_DEVICE:-cuda:1}"
+export TRANSLATION_DEVICES="${TRANSLATION_DEVICES:-cuda:1}"
 export TRANSLATION_COMPUTE_TYPE="${TRANSLATION_COMPUTE_TYPE:-int8_float16}"
 export TRANSLATION_INTER_THREADS="${TRANSLATION_INTER_THREADS:-1}"
 export TRANSLATION_INTRA_THREADS="${TRANSLATION_INTRA_THREADS:-4}"
@@ -163,20 +187,18 @@ export TRANSLATION_BEAM_SIZE="${TRANSLATION_BEAM_SIZE:-4}"
 export TRANSLATION_MAX_DECODING_LENGTH="${TRANSLATION_MAX_DECODING_LENGTH:-384}"
 export TRANSLATION_BATCH_SIZE="${TRANSLATION_BATCH_SIZE:-16}"
 export TRANSLATION_BATCH_WAIT_MS="${TRANSLATION_BATCH_WAIT_MS:-5}"
-export TRANSLATION_VI_PREFIX="${TRANSLATION_VI_PREFIX:-vi:}"
-export TRANSLATION_EN_PREFIX="${TRANSLATION_EN_PREFIX:-en:}"
-export TRANSLATE_VI_TARGET="${TRANSLATE_VI_TARGET:-en-US}"
-export TRANSLATE_EN_TARGET="${TRANSLATE_EN_TARGET:-vi-VN}"
+export TRANSLATION_VI_PREFIX="${TRANSLATION_VI_PREFIX:-vi: }"
+export TRANSLATION_EN_PREFIX="${TRANSLATION_EN_PREFIX:-en: }"
 export TRANSLATE_EMIT_SOURCE_PARTIALS="${TRANSLATE_EMIT_SOURCE_PARTIALS:-false}"
 
 # ---------------------------------------------------------------------------
 # TTS (Piper / ONNX Runtime-GPU) — GPU 2, 3  (co-locate với Translation)
 # ---------------------------------------------------------------------------
 export TTS_ENABLED="${TTS_ENABLED:-true}"
-export TTS_BACKEND="${TTS_BACKEND:-magpie}"
-export TTS_WORKERS="${TTS_WORKERS:-2}"                 # Magpie: 1 worker / GPU (~700 MB VRAM/worker)
-export TTS_DEVICE="${TTS_DEVICE:-cuda:2}"
-export TTS_DEVICES="${TTS_DEVICES:-cuda:2,cuda:3}"
+export TTS_BACKEND="${TTS_BACKEND:-piper}"
+export TTS_WORKERS="${TTS_WORKERS:-2}"
+export TTS_DEVICE="${TTS_DEVICE:-cuda:1}"
+export TTS_DEVICES="${TTS_DEVICES:-cuda:1}"
 export TTS_OUTPUT_PT="${TTS_OUTPUT_PT:-0}"
 export TTS_TARGET_SAMPLE_RATE="${TTS_TARGET_SAMPLE_RATE:-8000}"
 export TTS_MAX_TEXT_CHARS="${TTS_MAX_TEXT_CHARS:-2000}"
@@ -213,5 +235,9 @@ fi
 echo "[INFO]   ASR      = $ASR_DEVICES  (workers=$ASR_WORKERS)"
 echo "[INFO]   XLATION  = $TRANSLATION_DEVICES  (workers=$TRANSLATION_WORKERS)"
 echo "[INFO]   TTS      = $TTS_DEVICES  backend=$TTS_BACKEND  (workers=$TTS_WORKERS)"
+
+# All relative paths in nemotron-engine.yaml (models/, logs/) resolve from CWD.
+# cd to APP_DIR so the process always starts from the correct root.
+cd "$APP_DIR"
 
 exec "$PYTHON" -m nemotron_testbed.main

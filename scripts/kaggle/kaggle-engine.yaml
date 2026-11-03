@@ -1,0 +1,21 @@
+# Overrides for the Kaggle test run. run_tests_kaggle.sh deep-merges this file onto
+# etc/nemotron-engine.yaml, so everything not listed here is the production value
+# (2 ASR / 2 translation / 2 TTS workers, segmentation "on", int8_float16, ...).
+# Per-launch overrides (log file, vad.neg_threshold, asr.workers, single-GPU devices)
+# are added by the script with --set.
+
+asr:
+  use_language_source: true      # the switch under test
+
+audio_preprocessing:
+  enabled: false                 # the shipped yaml turns on mode audx; WER baselines (B, S, ...) must stay raw.
+                                 # A step that measures audx sets audio_preprocessing.enabled=true itself.
+
+vad:
+  neg_threshold: 0.35            # explicit, same as the shipped yaml
+  silero_model_path: models/silero/silero_vad.jit   # models/ is a symlink to the Kaggle Dataset
+
+logging:
+  level: INFO
+  pipeline_trace: true
+  pipeline_trace_text: true

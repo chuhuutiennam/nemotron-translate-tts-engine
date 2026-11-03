@@ -11,3 +11,5 @@ model/
 wheels_gpu/
 error/
 *.zip
+*.pcap
+models/audx/

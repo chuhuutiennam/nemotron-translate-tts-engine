@@ -1,0 +1,11 @@
+# Reference contract only - this package does not yet modify EngineCoordinator.
+audio_enhancement:
+  mode: off          # off | shadow | on; shadow needs a separate nonblocking worker
+  backend: audx
+  weights_path: /opt/models/audx/audx_weights_safe.pth
+  device: cpu        # or cuda:N after GPU benchmarking
+  input_sample_rate: 16000
+  process_after_rtp_repair: true
+  sample_rate_output: 16000
+  stream_state_scope: media_leg
+  benchmark_packet_ms: 80

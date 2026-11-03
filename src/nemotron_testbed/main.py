@@ -19,6 +19,25 @@ from .stats_logger import StatsLogger
 logger = logging.getLogger(__name__)
 
 
+def grpc_server_options(settings: Settings) -> tuple[tuple[str, int], ...]:
+    max_bytes = settings.max_rpc_message_mb * 1024 * 1024
+    return (
+        ("grpc.max_receive_message_length", max_bytes),
+        ("grpc.max_send_message_length", max_bytes),
+        ("grpc.keepalive_time_ms", settings.grpc_keepalive_time_ms),
+        ("grpc.keepalive_timeout_ms", settings.grpc_keepalive_timeout_ms),
+        (
+            "grpc.keepalive_permit_without_calls",
+            int(settings.grpc_keepalive_permit_without_calls),
+        ),
+        (
+            "grpc.http2.min_ping_interval_without_data_ms",
+            settings.grpc_min_ping_interval_without_data_ms,
+        ),
+        ("grpc.http2.max_ping_strikes", settings.grpc_max_ping_strikes),
+    )
+
+
 def configure_gpu_memory(settings: Settings) -> None:
     fraction = settings.cuda_memory_fraction
     if fraction <= 0.0:
@@ -79,10 +98,10 @@ async def serve() -> None:
     configure_logging(
         settings.log_level,
         settings.log_file,
-        settings.log_max_bytes,
         settings.log_backup_count,
         settings.console_log_level,
         settings.third_party_log_level,
+        settings.pipeline_trace_level if settings.pipeline_trace else None,
     )
     if settings.config_source == "env":
         logger.warning(
@@ -91,6 +110,8 @@ async def serve() -> None:
         )
     else:
         logger.info("Configuration loaded from: %s", settings.config_source)
+    for warning in settings.config_warnings:
+        logger.warning("CONFIG_DEPRECATED: %s", warning)
     configure_cpu_threads(settings)
     configure_gpu_memory(settings)
     MetricsServer(settings.metrics_port).start()
@@ -115,15 +136,7 @@ async def serve() -> None:
     await gpu_monitor.start()
 
     try:
-        max_bytes = settings.max_rpc_message_mb * 1024 * 1024
-        server = grpc.aio.server(
-            options=(
-                ("grpc.max_receive_message_length", max_bytes),
-                ("grpc.max_send_message_length", max_bytes),
-                ("grpc.keepalive_time_ms", settings.grpc_keepalive_time_ms),
-                ("grpc.keepalive_timeout_ms", settings.grpc_keepalive_timeout_ms),
-            )
-        )
+        server = grpc.aio.server(options=grpc_server_options(settings))
         speech_pb2_grpc.add_SpeechStreamServicer_to_server(
             SpeechStreamService(coordinator), server
         )

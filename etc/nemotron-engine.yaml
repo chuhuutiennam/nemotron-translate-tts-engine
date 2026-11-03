@@ -1,4 +1,4 @@
-# nemotron-engine.yaml — cấu hình GPU production (4x A30 24 GB)
+# nemotron-engine.yaml — cấu hình GPU production (2x L4 23 GB)
 #
 # Discovery order (first match wins):
 #   1. ENGINE_CONFIG_FILE env var
@@ -7,15 +7,18 @@
 #   4. Fallback: đọc từ env var (log warning)
 #
 # Mỗi key có env var tương đương ghi chú bên cạnh.
-# Env var LUÔN override giá trị trong file này.
+# File này có ưu tiên cao hơn env var. Env var chỉ được đọc khi key vắng mặt trong file.
 
 # ── gRPC / Transport ─────────────────────────────────────────────────────────
 grpc:
   server_address: "0.0.0.0:50052"       # GRPC_SERVER_ADDRESS
   max_message_mb: 8                      # MAX_RPC_MESSAGE_MB
   response_queue_size: 256               # RESPONSE_QUEUE_SIZE
-  keepalive_time_ms: 30000               # GRPC_KEEPALIVE_TIME_MS
-  keepalive_timeout_ms: 10000            # GRPC_KEEPALIVE_TIMEOUT_MS
+  keepalive_time_ms: 60000               # GRPC_KEEPALIVE_TIME_MS  (server chủ động ping khi kết nối im lặng)
+  keepalive_timeout_ms: 20000            # GRPC_KEEPALIVE_TIMEOUT_MS  (chờ PING ACK, quá hạn thì đóng kết nối)
+  keepalive_permit_without_calls: true   # GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS  (cho client ping cả khi không có RPC nào)
+  min_ping_interval_without_data_ms: 60000  # GRPC_MIN_PING_INTERVAL_WITHOUT_DATA_MS  (client ping nhanh hơn mức này bị tính một strike; 0 = không kiểm tra)
+  max_ping_strikes: 2                    # GRPC_MAX_PING_STRIKES  (quá số strike này server gửi GOAWAY too_many_pings và đóng kết nối; 0 = không đóng)
   stop_grace_s: 5.0                      # GRPC_STOP_GRACE_S
   result_queue_maxsize: 1024             # RESULT_QUEUE_MAXSIZE
   shutdown_timeout_s: 30.0              # SHUTDOWN_TIMEOUT_S
@@ -26,13 +29,27 @@ metrics:
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
-  level: INFO                            # LOG_LEVEL
+  level: INFO                            # LOG_LEVEL  (DEBUG ghi mỗi chunk một dòng, file lớn nhanh; trace pipeline vẫn ghi ra file nhờ pipeline_trace_level)
   console_level: ERROR                   # CONSOLE_LOG_LEVEL
   third_party_level: ERROR               # THIRD_PARTY_LOG_LEVEL
   file: logs/nemotron-engine.log         # LOG_FILE  (relative to APP_DIR khi chạy từ đó)
-  max_bytes: 104857600                   # LOG_MAX_BYTES  (100 MB)
-  backup_count: 10                       # LOG_BACKUP_COUNT
+  backup_count: 10                       # LOG_BACKUP_COUNT  (số ngày giữ log; xoay lúc 00:00 giờ local)
+  pipeline_trace: true                   # LOG_PIPELINE_TRACE  (log từng chặng ASR_FINAL/TRANSLATE/TTS_PHRASE/EMIT ở mức pipeline_trace_level, DEGRADE ở WARNING)
+  pipeline_trace_level: DEBUG            # LOG_PIPELINE_TRACE_LEVEL  (mặc định DEBUG; độc lập với logging.level: trace vẫn ghi ra file khi logging.level=INFO, các dòng DEBUG khác như VAD step/GRPC_IN/GRPC_OUT vẫn theo logging.level)
+  pipeline_trace_text: true              # LOG_PIPELINE_TRACE_TEXT  (false = chỉ ghi độ dài text, không ghi nội dung lời nói)
+  pipeline_trace_partial: true           # LOG_PIPELINE_TRACE_PARTIAL  (ghi ASR_PARTIAL mỗi bước ASR để kiểm chứng độ ổn định; ~2 dòng/giây/stream, cần pipeline_trace=true; phân tích bằng scripts/check_segmentation.py)
   suppress_model_init_output: true       # SUPPRESS_MODEL_INIT_OUTPUT
+
+# ── Trace pcap (docs/trace-pcap-design.md) ────────────────────────────────────
+# Bật: mỗi stream một file pcap L16 16 kHz gồm luồng "in" (chunk như gateway gửi) và "audx" (sau AudX, căn thẳng hàng);
+# nghe bằng Wireshark (RTP Player) hoặc scripts/trace_pcap_to_wav.py. ~256 MB/giờ mỗi stream, file chứa audio cuộc gọi
+# không mã hoá và không tự xoá: chỉ bật khi kiểm tra. Đổi giá trị phải restart engine.
+trace_pcap:
+  enabled: false                         # TRACE_PCAP_ENABLED
+  dir: logs/pcap                         # TRACE_PCAP_DIR  (relative to APP_DIR khi chạy từ đó)
+  max_streams: 0                         # TRACE_PCAP_MAX_STREAMS  (số stream ghi cùng lúc; 0 = mọi stream)
+  max_seconds: 0                         # TRACE_PCAP_MAX_SECONDS  (số giây audio "in" tối đa mỗi stream; 0 = không giới hạn)
+  min_free_mb: 5120                      # TRACE_PCAP_MIN_FREE_MB  (đĩa còn ít hơn: không mở file mới, đóng các file đang ghi; 0 = không kiểm tra)
 
 # ── Stats / Monitoring ────────────────────────────────────────────────────────
 stats:
@@ -41,21 +58,21 @@ stats:
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 tuning:
-  model_loading_timeout_s: 1800.0        # MODEL_LOADING_TIMEOUT_S  (30 phút cho 4+4+4 workers)
+  model_loading_timeout_s: 1800.0        # MODEL_LOADING_TIMEOUT_S  (30 phút cho 2+2+2 workers)
   asr_backlog_soft_ms: 320.0             # ASR_BACKLOG_SOFT_MS
   asr_backlog_hard_ms: 800.0             # ASR_BACKLOG_HARD_MS
   short_utterance_ms: 300.0             # SHORT_UTTERANCE_MS
 
-# ── ASR — GPU 0, 1 ────────────────────────────────────────────────────────────
+# ── ASR — GPU 0 ───────────────────────────────────────────────────────────────
 asr:
   model_path: models/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo
                                          # MODEL_PATH
   language: vi-VN                        # ASR_LANGUAGE
-  device: cuda:0                         # ASR_DEVICE  (fallback khi ASR_DEVICES không set)
+  use_language_source: true              # ASR_USE_LANGUAGE_SOURCE  (true = dùng AudioChunk.language_source: translate -> nguồn cố định vi/en, transcribe -> thắng `language`; trống/không hợp lệ -> như false. false = translate luôn auto, transcribe theo `language`)
+  device: cuda:0                        # ASR_DEVICE  (fallback khi ASR_DEVICES không set)
   devices:                               # ASR_DEVICES
     - cuda:0
-    - cuda:1
-  workers: 4                             # ASR_WORKERS  (2 workers/GPU)
+  workers: 2                             # ASR_WORKERS
   beam_size: 1                           # ASR_BEAM_SIZE
   left_context: 56                       # MODEL_LEFT_CONTEXT
   lookahead_tokens: 6                    # MODEL_LOOKAHEAD_TOKENS  (→ 560ms chunk)
@@ -63,26 +80,42 @@ asr:
   runtime_queue_size: 512                # RUNTIME_QUEUE_SIZE
   cpu_threads: 8                         # CPU_THREADS
   cpu_interop_threads: 2                 # CPU_INTEROP_THREADS
-  cuda_memory_fraction: 0.90             # CUDA_MEMORY_FRACTION  (PyTorch GPU 0–1)
+  cuda_memory_fraction: 0.90             # CUDA_MEMORY_FRACTION  (PyTorch GPU 0)
 
 # ── VAD / Endpointing ─────────────────────────────────────────────────────────
 vad:
   enabled: true                          # VAD_ENABLED
   backend: silero                        # VAD_BACKEND  (energy | silero)
   threshold: 0.5                         # VAD_THRESHOLD
+  neg_threshold: 0.35                    # VAD_NEG_THRESHOLD  (= threshold - 0.15 như Silero VADIterator; điểm trong [neg_threshold, threshold) là dải trung tính: không tính là im lặng cho END, không reset bộ đếm START; phải trong (0, threshold]; đặt = threshold để tắt hysteresis; null = tự tính max(threshold - 0.15, 0.01), nên đổi threshold thì phải đổi lại giá trị này)
   energy_db_threshold: -42.0             # VAD_ENERGY_DB_THRESHOLD
   min_speech_ms: 250                     # VAD_MIN_SPEECH_MS
-  end_silence_ms: 400                    # VAD_END_SILENCE_MS
+  end_silence_ms: 250                    # VAD_END_SILENCE_MS  (giảm từ 400 để cắt utterance sớm hơn; đếm theo cửa sổ Silero 32 ms: 300 = 320 ms, 250 = 256 ms, 200 = 224 ms; END vẫn quyết định khi chunk đến)
   pre_roll_ms: 150                       # VAD_PRE_ROLL_MS
+  no_start_warn_ms: 5000                 # VAD_NO_START_WARN_MS  (cảnh báo khi stream nhận ngần này audio mà VAD chưa START lần nào; 0 = tắt)
   device: cpu                            # VAD_DEVICE
-  max_utterance_ms: 20000                # MAX_UTTERANCE_MS
+  max_utterance_ms: 10000                # MAX_UTTERANCE_MS  (giảm từ 20000 để chặn trần độ trễ audio dịch)
   silero_model_path: null                # SILERO_MODEL_PATH  (null = auto-download lần đầu)
   # silero_model_path: models/silero/silero_vad.jit
+
+# ── Sentence segmentation (cắt câu theo dấu câu trong utterance) ─────────────
+segmentation:
+  mode: "on"                             # SEGMENTATION_MODE  (off | shadow | on, nên để trong dấu nháy; shadow chỉ ghi log SEGMENT_* + metrics, KHÔNG đổi output; on = dịch + TTS + phát từng câu, CHỈ bật sau khi có số liệu shadow; cần restart)
+  stable_n: 2                            # SEGMENTATION_STABLE_N  (cắt tại dấu phẩy: câu phải giữ nguyên qua N bước model; 1 bước = chunk model, 560 ms ở lookahead_tokens=6; cũng là mặc định của punct_stable_n)
+  stable_ms: 0                           # SEGMENTATION_STABLE_MS  (cắt tại dấu phẩy: hoặc giữ nguyên >= ngần này ms; 0 = tắt; cũng là mặc định của punct_stable_ms)
+  punct_stable_n: 1                      # SEGMENTATION_PUNCT_STABLE_N  (dấu mạnh . ? !: số bước model câu phải giữ nguyên; bỏ key = dùng stable_n; 1 = commit ngay lần đầu thấy, sớm hơn ~1 bước nhưng dễ premature)
+  punct_stable_ms: 0                     # SEGMENTATION_PUNCT_STABLE_MS  (dấu mạnh . ? !: hoặc giữ nguyên >= ngần này ms; 0 = tắt; bỏ key = dùng stable_ms)
+  min_tokens: 6                          # SEGMENTATION_MIN_TOKENS  (câu ngắn hơn được gộp với câu sau; đếm theo từ \w+ nên "I'll" = 2; 6 để không cắt câu ASR chấm giữa chừng như "Oh, then you really need.")
+  max_segment_ms: 8000                   # SEGMENTATION_MAX_SEGMENT_MS  (không có dấu câu ổn định -> cắt cứng; 0 = tắt)
+  comma_after_ms: 0                      # SEGMENTATION_COMMA_AFTER_MS  (cắt tại dấu phẩy cuối khi segment dài hơn ngần này ms; 0 = tắt)
+  speech_to_text: true                   # SEGMENTATION_SPEECH_TO_TEXT  (áp dụng segment cho task speech_to_text: mode on = gửi is_final=true cho từng câu đã commit, partial/FINAL chỉ còn phần còn lại; mode shadow = chỉ log; false = giữ hành vi cũ, 1 final/utterance)
+  stt_punct_stable_n: 2                  # SEGMENTATION_STT_PUNCT_STABLE_N  (như punct_stable_n nhưng riêng cho speech_to_text; câu đã gửi is_final không sửa lại được nên để >= 2; bỏ key = dùng punct_stable_n)
+  stt_punct_stable_ms: 0                 # SEGMENTATION_STT_PUNCT_STABLE_MS  (như punct_stable_ms nhưng riêng cho speech_to_text; 0 = tắt; bỏ key = dùng punct_stable_ms)
 
 # ── Backpressure / Admission control ─────────────────────────────────────────
 backpressure:
   max_ingress_audio_ms: 120000           # MAX_INGRESS_AUDIO_MS
-  max_postprocess_pending_per_rpc: 8     # MAX_POSTPROCESS_PENDING_PER_RPC
+  max_postprocess_pending_per_rpc: 16    # MAX_POSTPROCESS_PENDING_PER_RPC  (đếm theo segment khi segmentation.mode=on; vượt ngưỡng -> fail_rpc RESOURCE_EXHAUSTED; 8 nếu mode off)
   max_concurrent_rpcs: 0                 # MAX_CONCURRENT_RPCS  (0 = unlimited)
   max_concurrent_utterances: 0           # MAX_CONCURRENT_UTTERANCES  (0 = unlimited)
   rpc_max_idle_s: 300                    # RPC_MAX_IDLE_S
@@ -94,43 +127,90 @@ rtp:
   out_of_order_policy: drop              # RTP_OUT_OF_ORDER_POLICY  (drop | error | accept)
   jitter_tolerance_ms: 20                # RTP_JITTER_TOLERANCE_MS
 
-# ── Translation — GPU 2, 3 ────────────────────────────────────────────────────
+# ── Audio pre-processing (khử nhiễu trước VAD/ASR: resemble-enhance hoặc AudX) ──
+# TẮT = luồng audio hiện tại giữ nguyên, không nạp model. Bật = thêm độ trễ hằng số
+# D = hop_ms + right_context_ms + compute_budget_ms (window của model đang chọn) vào VAD START, partial, final, first-audio.
+# Chọn model bằng `model`; mỗi model có khối cấu hình và window riêng, nên đổi model không phải sửa số nào khác.
+# Cần restart khi đổi. Trọng số nằm sẵn trên máy (không tải lúc chạy):
+#   resemble: python scripts/kaggle/enhance_wavs.py fetch --assets-dir models/resemble-enhance
+#   audx: chép tay audx_weights_safe.pth vào models/audx/ (copy-models.sh không chép)
+# ĐANG BẬT audx cho 100% stream (2026-10-30, để thử; WER tiếng Việt chưa đo). Tắt: enabled: false; quay lại denoiser: model: resemble.
+audio_preprocessing:
+  enabled: true                          # AUDIO_PREPROCESSING_ENABLED
+  model: audx                            # AUDIO_PREPROCESSING_MODEL  (resemble | audx; chỉ chạy một; resemble = resemble-enhance, khối resemble; audx = AudX có trạng thái theo stream, khối audx, không nạp resemble; xem docs/audx-stateful-design.md)
+  sample_percent: 100                    # AUDIO_PREPROCESSING_SAMPLE_PERCENT  (% stream bật, chọn ngẫu nhiên mỗi stream; canary)
+  devices:                               # AUDIO_PREPROCESSING_DEVICES  (worker i chạy trên devices[i % số device]; không đặt = cpu, chỉ để replay offline; không có key `device` đơn)
+    - cuda:1
+  workers: 1                             # AUDIO_PREPROCESSING_WORKERS
+  queue_max: 64                          # AUDIO_PREPROCESSING_QUEUE_MAX  (đầy -> vùng đó dùng audio gốc; chưa đo)
+  max_streams: 0                         # AUDIO_PREPROCESSING_MAX_STREAMS  (0 = không giới hạn; vượt -> stream mới đi luồng cũ)
+  zero_run_min_samples: 64               # AUDIO_PREPROCESSING_DITHER_MIN_ZERO_RUN  (mọi model: đoạn số 0 tuyệt đối dài từ mức này là im lặng số, đầu ra ép về 0; trước đây là dither.min_zero_run_samples)
+  vad_input: enhanced                    # AUDIO_PREPROCESSING_VAD_INPUT  (enhanced | raw)
+  fallback:
+    consecutive_bad_regions: 3           # AUDIO_PREPROCESSING_FALLBACK_BAD_REGIONS  (chưa đo)
+    bypass_seconds: 10                   # AUDIO_PREPROCESSING_FALLBACK_BYPASS_S  (0 = bypass đến hết stream; chưa đo)
+  resemble:                              # chỉ khi model = resemble (resemble-enhance)
+    mode: denoiser                       # AUDIO_PREPROCESSING_MODE  (denoiser | enhancer; enhancer sinh lại tín hiệu, D ~4-5 s, rất nặng)
+    assets_dir: models/resemble-enhance  # AUDIO_PREPROCESSING_ASSETS_DIR  (denoiser.onnx, enhancer_stage2/, resemble-enhance/)
+    window:                              # 0 = mặc định theo mode (denoiser 1000/500/500/500, enhancer 1000/2000/1000/1500)
+      left_context_ms: 0                 # AUDIO_PREPROCESSING_LEFT_CONTEXT_MS
+      hop_ms: 0                          # AUDIO_PREPROCESSING_HOP_MS
+      right_context_ms: 0                # AUDIO_PREPROCESSING_RIGHT_CONTEXT_MS  (lookahead, quyết định độ trễ)
+      crossfade_ms: 40                   # AUDIO_PREPROCESSING_CROSSFADE_MS
+      compute_budget_ms: 200             # AUDIO_PREPROCESSING_COMPUTE_BUDGET_MS  (~1.5x p99 audio_preproc_window_seconds + chờ hàng đợi; 200 -> D = 1.2 s, p99 probe L4 27 ms; chỉnh tiếp theo audio_preproc_slack_seconds)
+    enhancer:                            # chỉ mode enhancer
+      nfe: 32                            # AUDIO_PREPROCESSING_ENHANCER_NFE
+      lambd: 1.0                         # AUDIO_PREPROCESSING_ENHANCER_LAMBD
+      tau: 0.5                           # AUDIO_PREPROCESSING_ENHANCER_TAU
+      align_regions: true                # AUDIO_PREPROCESSING_ENHANCER_ALIGN_REGIONS  (xcorr triệt trôi độ trễ nội tại -11..+23 ms)
+      align_max_ms: 40                   # AUDIO_PREPROCESSING_ENHANCER_ALIGN_MAX_MS
+    dither:                              # nhiễu Gaussian vào đoạn số 0 dài trước model, rồi ép zero lại (model làm mất onset sau digital silence)
+      sigma_lsb: 3.0                     # AUDIO_PREPROCESSING_DITHER_SIGMA_LSB
+      seed: 0                            # AUDIO_PREPROCESSING_DITHER_SEED
+  audx:                                  # chỉ khi model = audx (AudX; checkpoint nạp weights_only, kiểm tên + shape)
+    checkpoint: models/audx/audx_weights_safe.pth  # AUDIO_PREPROCESSING_AUDX_CHECKPOINT  (state_dict hoặc {'state_dict': ...} của POC)
+    agc_target_dbfs: -28                 # AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS  (AGC chỉ tăng gain: tiếng nói nhỏ hơn mức này được nâng lên trước model rồi trả lại sau; AudX tệ đi khi tiếng nói <= -38 dBFS)
+    agc_max_gain_db: 30                  # AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB  (0 = tắt AGC)
+    window:                              # không có left/right: look-ahead cố định 64 ms theo model; D = hop + 64 + budget
+      hop_ms: 80                         # AUDIO_PREPROCESSING_AUDX_HOP_MS  (chu kỳ gửi audio cho model, bội số 16 ms; 0 = 80)
+      crossfade_ms: 10                   # AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS  (chuyển raw <-> enhanced; < compute_budget_ms)
+      compute_budget_ms: 100             # AUDIO_PREPROCESSING_AUDX_COMPUTE_BUDGET_MS  (0 = 100; 100 -> D = 80 + 64 + 100 = 244 ms; chưa đo GPU)
+
+# ── Translation — GPU 1 ───────────────────────────────────────────────────────
 translation:
   enabled: true                          # TRANSLATION_ENABLED
   model_path: models/envit5_ctranslate2  # TRANSLATION_MODEL_PATH
   tokenizer_path: models/envit5_ctranslate2  # TRANSLATION_TOKENIZER_PATH
-  device: cuda:2                         # TRANSLATION_DEVICE  (fallback)
+  device: cuda:1                         # TRANSLATION_DEVICE  (fallback)
   devices:                               # TRANSLATION_DEVICES
-    - cuda:2
-    - cuda:3
-  compute_type: int8_float16             # TRANSLATION_COMPUTE_TYPE  (Ampere Tensor Core)
+    - cuda:1
+  compute_type: int8_float16             # TRANSLATION_COMPUTE_TYPE
   inter_threads: 1                       # TRANSLATION_INTER_THREADS
   intra_threads: 4                       # TRANSLATION_INTRA_THREADS
   queue_size: 128                        # TRANSLATION_QUEUE_SIZE
-  workers: 4                             # TRANSLATION_WORKERS  (2 workers/GPU)
+  workers: 2                             # TRANSLATION_WORKERS
   beam_size: 4                           # TRANSLATION_BEAM_SIZE
   max_decoding_length: 384               # TRANSLATION_MAX_DECODING_LENGTH
   batch_size: 16                         # TRANSLATION_BATCH_SIZE
   batch_wait_ms: 5                       # TRANSLATION_BATCH_WAIT_MS
-  vi_prefix: "vi:"                       # TRANSLATION_VI_PREFIX
-  en_prefix: "en:"                       # TRANSLATION_EN_PREFIX
-  vi_target: en-US                       # TRANSLATE_VI_TARGET
-  en_target: vi-VN                       # TRANSLATE_EN_TARGET
+  vi_prefix: "vi: "                      # TRANSLATION_VI_PREFIX
+  en_prefix: "en: "                      # TRANSLATION_EN_PREFIX
   emit_source_partials: false            # TRANSLATE_EMIT_SOURCE_PARTIALS
 
-# ── TTS — GPU 2, 3 (co-locate với Translation) ───────────────────────────────
+# ── TTS — GPU 1 (co-locate với Translation) ──────────────────────────────────
 tts:
   enabled: true                          # TTS_ENABLED
-  backend: magpie                        # TTS_BACKEND  (piper | magpie)
-  workers: 2                             # TTS_WORKERS  (Magpie: 1 worker/GPU ~700 MB VRAM)
-  device: cuda:2                         # TTS_DEVICE  (fallback)
+  backend: piper                         # TTS_BACKEND  (piper | magpie)
+  workers: 2                             # TTS_WORKERS
+  device: cuda:1                         # TTS_DEVICE  (fallback)
   devices:                               # TTS_DEVICES
-    - cuda:2
-    - cuda:3
+    - cuda:1
   queue_size: 64                         # TTS_QUEUE_SIZE
   output_pt: 0                           # TTS_OUTPUT_PT  (0=PCMU | 8=PCMA)
   target_sample_rate: 8000               # TTS_TARGET_SAMPLE_RATE
   max_text_chars: 2000                   # TTS_MAX_TEXT_CHARS
+  continuation_retry_ms: 2000            # TTS_CONTINUATION_RETRY_MS  (0 = degrade at once when queue full)
+  max_audio_chunk_bytes: 0               # TTS_MAX_AUDIO_CHUNK_BYTES  (0 = never split; else max G.711 bytes per EMIT, multiple of 160)
   length_scale: 1.0                      # TTS_LENGTH_SCALE
   noise_scale: 0.667                     # TTS_NOISE_SCALE
   noise_w_scale: 0.8                     # TTS_NOISE_W_SCALE

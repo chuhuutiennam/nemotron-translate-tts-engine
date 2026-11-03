@@ -1,0 +1,16 @@
+#!/bin/bash                                                                                                                                       
+CACHE_DIR="models/hf_cache"                                                                                                                       
+CACHE_NAME="models--microsoft--wavlm-base-plus"                                                                                                   
+HASH="0000000000000000000000000000000000000001"                                                                                                 
+
+mkdir -p "${CACHE_DIR}/${CACHE_NAME}/refs"
+mkdir -p "${CACHE_DIR}/${CACHE_NAME}/snapshots/${HASH}"
+
+echo -n "${HASH}" > "${CACHE_DIR}/${CACHE_NAME}/refs/main"
+
+cp models/wavlm-base-plus/config.json              "${CACHE_DIR}/${CACHE_NAME}/snapshots/${HASH}/"
+cp models/wavlm-base-plus/preprocessor_config.json "${CACHE_DIR}/${CACHE_NAME}/snapshots/${HASH}/"
+cp models/wavlm-base-plus/pytorch_model.bin        "${CACHE_DIR}/${CACHE_NAME}/snapshots/${HASH}/"
+
+echo "Done. Structure:"
+find "${CACHE_DIR}/${CACHE_NAME}" -type f

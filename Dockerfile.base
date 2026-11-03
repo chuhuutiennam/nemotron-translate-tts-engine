@@ -1,0 +1,77 @@
+FROM docker-registry:4000/mcf-ai-base:v1
+
+WORKDIR /app
+
+# Python virtual environment
+RUN python3.12 -m venv /opt/nemotron-venv
+
+ENV PATH=/opt/nemotron-venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_INDEX=1 \
+    TOKENIZERS_PARALLELISM=false \
+    NUMBA_CACHE_DIR=/tmp/numba-cache \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    XDG_CACHE_HOME=/tmp/.cache
+
+# Offline wheelhouse
+COPY wheels/ /opt/wheels/
+
+# Install exactly the offline wheels supplied with the build context.
+RUN python -m pip install \
+    --no-cache-dir \
+    --no-index \
+    --no-deps \
+    /opt/wheels/*.whl
+
+# Validate the important runtime dependencies.
+RUN python -c "\
+import grpc; \
+import google.protobuf; \
+import numpy as np; \
+import soundfile as sf; \
+import torch; \
+import wrapt; \
+import ctranslate2; \
+import transformers; \
+import onnxruntime as ort; \
+from piper import PiperVoice; \
+from nemo.collections.asr.models.rnnt_bpe_models_prompt import EncDecRNNTBPEModelWithPrompt; \
+print('torch:', torch.__version__); \
+print('torch.cuda.is_available:', torch.cuda.is_available()); \
+print('grpcio:', grpc.__version__); \
+print('protobuf:', google.protobuf.__version__); \
+print('soundfile:', sf.__version__); \
+print('libsndfile:', sf.__libsndfile_version__); \
+print('wrapt:', wrapt.__version__); \
+print('ctranslate2:', ctranslate2.__version__); \
+print('ctranslate2 devices:', ctranslate2.get_supported_devices()); \
+print('ctranslate2 cuda types:', ctranslate2.get_supported_compute_types('cuda') if 'cuda' in ctranslate2.get_supported_devices() else 'N/A (CPU-only build)'); \
+print('onnxruntime:', ort.__version__); \
+print('onnxruntime providers:', ort.get_available_providers()); \
+print('transformers:', transformers.__version__); \
+print('PiperVoice:', PiperVoice.__name__); \
+print('Prompt RNNT:', EncDecRNNTBPEModelWithPrompt.__name__); \
+print('Nemotron base runtime validation: OK')"
+
+# Verify libsndfile actually works.
+RUN python -c "\
+import numpy as np, soundfile as sf; \
+p='/tmp/test.wav'; \
+sf.write(p, np.zeros(1600, dtype=np.float32), 16000, subtype='PCM_16'); \
+audio, sr = sf.read(p, dtype='float32'); \
+assert sr == 16000; \
+assert len(audio) == 1600; \
+print('soundfile validation: OK')"
+
+# Prepare writable cache locations and remove build-only material.
+RUN mkdir -p \
+      /tmp/numba-cache \
+      /tmp/matplotlib \
+      /tmp/.cache \
+    && rm -rf \
+      /opt/wheels \
+      /root/.cache/pip \
+      /tmp/test.wav
+
+CMD ["python", "--version"]

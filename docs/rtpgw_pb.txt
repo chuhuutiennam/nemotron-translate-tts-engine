@@ -1,0 +1,27 @@
+hông số RTPGW cần bảo đảm
+Thuộc tính	Giá trị
+Audio codec đầu vào	G.711 PCMA/PCMU
+Audio gửi AI	Raw PCM S16LE
+Sample rate	16.000 Hz
+Channels	1 (mono)
+Bit depth	16-bit signed
+Byte order	Little-endian
+Chunk duration	80 ms (đề xuất)
+Samples/chunk	1.280
+Payload size	2.560 bytes
+RTP clock rate	8.000 Hz (clock gốc của G.711)
+
+AudioChunk {
+    session_id: "call-001"
+    stream_id: "call-001-tcore"
+    pcm: <2560 bytes raw PCM S16LE>
+    sample_rate: 16000
+    channels: 1
+    rtp_timestamp: 100000
+    rtp_clock_rate: 8000
+    duration_ms: 80
+    chunk_seq: 0
+    end_of_stream: false
+    language: "en-US"
+    task: "realtime_translation|speech_to_text"
+}
