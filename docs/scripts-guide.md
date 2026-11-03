@@ -1014,10 +1014,22 @@ Dùng khi không có Kaggle. Trên một máy Ubuntu không có GPU, chạy đư
 
 **Chuẩn bị** (một lần):
 1. Máy cần:
-   - Internet, để cài gói và lần đầu tải bộ test từ HuggingFace;
-   - `unzip`;
+   - Internet, để cài gói, clone repo và lần đầu tải bộ test từ HuggingFace;
+   - `git`;
    - `uv`. Ubuntu 23.04 trở đi chặn `pip install` vào python hệ thống, nên cài `uv` trước, ví dụ `pipx install uv`.
-2. Source: zip từ working tree hiện tại, **có thư mục `tests`** (lệnh zip ở mục 8.3), giải nén vào ví dụ `~/engine`.
+2. Source: clone repo private `chuhuutiennam/nemotron-translate-tts-engine` (nhánh `master`, đã có thư mục `tests`) vào `~/engine`:
+   ```bash
+   git clone https://github.com/chuhuutiennam/nemotron-translate-tts-engine.git ~/engine
+   ```
+   Repo là private nên git hỏi đăng nhập:
+   - `Username`: `chuhuutiennam`;
+   - `Password`: **không phải mật khẩu GitHub** mà là một token. Tạo token ở GitHub → Settings → Developer settings → Fine-grained tokens: chỉ chọn repo `nemotron-translate-tts-engine`, quyền **Contents: Read-only** (đủ để clone và pull).
+
+   Để không phải nhập lại token mỗi lần `git pull`: `git config --global credential.helper 'cache --timeout=28800'` (giữ trong RAM 8 giờ). Tránh `credential.helper store`, vì nó ghi token ra `~/.git-credentials` dưới dạng chữ thường. Cách khác là dùng SSH key: thêm `~/.ssh/id_ed25519.pub` vào GitHub → Settings → SSH and GPG keys, rồi clone `git@github.com:chuhuutiennam/nemotron-translate-tts-engine.git`.
+
+   Lưu ý:
+   - Bản clone chỉ có những gì đã commit **và push**. Thay đổi chưa commit trên máy dev không có ở đây. Sau mỗi lần push từ máy dev, cập nhật bằng `cd ~/engine && git pull`.
+   - `asr_data/` bị `.gitignore`, nên bản clone không có `asr_data/OSR_us_000_0017_8k.wav`. Chỉ bước `E` cần file này; muốn chạy `E` thì chép riêng vào `~/engine/asr_data/`. Bước `B` (lượt A/F của mục 8.3) không cần.
 3. Model: chép `APP_DIR/models` của server vào ví dụ `~/engine-models`, để dùng cùng file `.nemo` với server. Setup kiểm đủ các file sau:
    - `nemotron-3.5-asr-streaming-0.6b/*.nemo`;
    - `envit5_ctranslate2/`;
@@ -1030,6 +1042,7 @@ Dùng khi không có Kaggle. Trên một máy Ubuntu không có GPU, chạy đư
    uv pip install --python $HOME/engine-venv/bin/python pytest
    ```
    Cài đúng thì log có `cuda available: False`, `DEVICE=cpu: CUDA not required` và `setup OK`. Có dòng `UNRESOLVED` thì gửi lại log.
+   Setup tạo symlink `~/engine/models` trỏ tới `MODELS_DIR`. `git status` sẽ thấy `models` là file mới; **đừng commit** symlink này.
 
 **Chạy** (từ `~/engine`):
 ```bash

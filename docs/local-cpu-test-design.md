@@ -93,10 +93,11 @@ Nội dung là script của ô 5 hiện tại, chỉ đổi:
 
 ### 3.4 `docs/scripts-guide.md`, mục 8.4 mới
 
-Gồm: chép source (working tree, có `tests`) và model sang máy; setup; pytest; `check_mel.py`; chạy A/F với `LIMIT=20` rồi đủ 200 clip; kiểm log; chấm điểm. Phác thảo:
+Gồm: lấy source bằng `git clone` repo private `chuhuutiennam/nemotron-translate-tts-engine` (có `tests`; đăng nhập bằng fine-grained token chỉ đọc), chép model sang máy; setup; pytest; `check_mel.py`; chạy A/F với `LIMIT=20` rồi đủ 200 clip; kiểm log; chấm điểm. Bản clone chỉ có code đã commit và push. Phác thảo:
 
 ```bash
-cd ~/engine                                  # source giải nén từ zip ở mục 8.3
+git clone https://github.com/chuhuutiennam/nemotron-translate-tts-engine.git ~/engine   # lần sau: git pull
+cd ~/engine
 export VENV=~/engine-venv DEVICE=cpu
 MODELS_DIR=~/engine-models bash scripts/kaggle/setup_kaggle.sh   # model chép từ APP_DIR/models trên server
 uv pip install --python "$VENV/bin/python" pytest
@@ -128,7 +129,8 @@ Các mục khác cần thêm: bảng script (`check_mel.py`); danh sách biến 
 - RAM **chưa đo**. Mỗi worker ASR giữ một bản model fp32 riêng. Theo dõi `free -h` trong lượt `LIMIT=20`.
 - `nproc` đếm luồng logic (tính cả hyper-thread).
 - torch `+cu124` kéo theo thư viện nvidia, tải vài GB.
-- Máy cần internet: cài gói bằng uv/pip, và lần đầu tải bộ test từ HuggingFace (`eval_wer.py prepare`).
+- Máy cần internet: clone repo, cài gói bằng uv/pip, và lần đầu tải bộ test từ HuggingFace (`eval_wer.py prepare`).
+- `asr_data/` bị `.gitignore` nên bản clone không có WAV tiếng Anh của bước E; bước B không cần.
 - Trên Linux có torch, các test cần torch (`test_audx_model`, `test_runtime_features`) lần đầu chạy chung với cả bộ pytest.
 
 ## 6. Test
@@ -188,6 +190,6 @@ Các mục khác cần thêm: bảng script (`check_mel.py`); danh sách biến 
 ## 9. Thứ tự làm
 
 1. Code và test trên máy này (mục 6).
-2. Bạn chép source và model sang máy Ubuntu, chạy setup, pytest, `check_mel.py`, `LIMIT=20`, rồi gửi log.
+2. Bạn clone repo và chép model sang máy Ubuntu, chạy setup, pytest, `check_mel.py`, `LIMIT=20`, rồi gửi log.
 3. Mình phân tích log, sau đó chạy đủ 200 clip A/F.
 4. Cập nhật tài liệu và memory.
