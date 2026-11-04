@@ -206,6 +206,97 @@ class AudxModelTest(unittest.TestCase):
         np.testing.assert_array_equal(self.model._agc(self.model.new_state(), silent), 1.0)
         self.assertEqual(off._agc(off.new_state(), quiet), None)
 
+    # ── section 9 of docs/audx-stateful-design.md: AGC ceiling, clamp of the model output ──
+
+    def _gains(self, model, x, sizes):
+        """_agc over x in pieces, keeping state.received as step() does."""
+        state = model.new_state()
+        parts, pos, i = [], 0, 0
+        while pos < x.size:
+            piece = x[pos : pos + sizes[i % len(sizes)]]
+            parts.append(model._agc(state, piece))
+            state.received += piece.size
+            pos += piece.size
+            i += 1
+        return np.concatenate(parts)
+
+    def test_agc_ceiling_keeps_the_boosted_block_below_it(self):
+        # as on the first real trace: a -61 dBFS click sets the AGC level, then loud speech arrives
+        block = ax.AGC_BLOCK
+        rng = np.random.default_rng(11)
+        click = (rng.standard_normal(block) * 10 ** (-61 / 20)).astype(np.float32)
+        start = 11 * block
+        capped = ax.AudxModel(self.checkpoint, "cpu", agc_ceiling_dbfs=-16.0)
+
+        def signal(speech_dbfs):
+            speech = (rng.standard_normal(8 * block) * 10 ** (speech_dbfs / 20)).astype(np.float32)
+            return np.concatenate([click, np.zeros(10 * block, np.float32), speech])
+
+        def block_dbfs(x, gains):
+            y = (x[start:] * gains[start:]).astype(np.float64).reshape(-1, block)
+            return 10 * np.log10(np.mean(y**2, axis=1))
+
+        x = signal(-22.0)  # between the -28 dBFS target and the ceiling
+        for sizes in ([1280], [100, 333]):  # whole 20 ms blocks, and blocks split across step() calls
+            with self.subTest(sizes=sizes):
+                self.assertGreater(block_dbfs(x, self._gains(self.model, x, sizes))[0], 0.0)  # no ceiling: overload
+                levels = block_dbfs(x, self._gains(capped, x, sizes))
+                self.assertLessEqual(float(levels.max()), -16.0 + 1e-3)
+                # the first block is boosted up to the ceiling; a split block keeps the lowest cap of its parts
+                # for the rest of the block (a short first part estimates its power loosely), so it may stay lower
+                self.assertGreater(float(levels[0]), -16.5 if sizes == [1280] else -20.0)
+        # louder than the ceiling: boost-only, so not boosted at all (and never cut)
+        x = signal(-12.0)
+        np.testing.assert_array_equal(self._gains(capped, x, [1280])[start:], 1.0)
+        # a ceiling that never binds changes nothing
+        quiet = self._signal(8_000, seed=8) * 0.03  # ~-50 dBFS, boosted to about -28 dBFS
+        np.testing.assert_array_equal(self._gains(capped, quiet, [1280]), self._gains(self.model, quiet, [1280]))
+
+    def _constant_estimate(self, value, **kwargs):
+        """An AudxModel whose network predicts `value` for every bin, whatever its input."""
+        model = ax.AudxModel(self.checkpoint, "cpu", agc_max_gain_db=0, **kwargs)
+        with self.torch.no_grad():
+            model.net.fc.weight.zero_()
+            model.net.fc.bias.fill_(value)
+        return model
+
+    def test_clamp_keeps_every_bin_between_the_floor_and_the_input(self):
+        x = self._signal(9_001, seed=12)
+        floor = 10 ** (-12 / 20)
+        for value, kwargs, expected in (
+            (1e3, {"clamp_to_input": True}, x),  # never above the input bin: the input comes back
+            (0.0, {"max_attenuation_db": 12.0}, x * floor),  # never cut by more than 12 dB
+            (1e3, {"clamp_to_input": True, "max_attenuation_db": 12.0}, x),
+            (0.0, {"clamp_to_input": True, "max_attenuation_db": 12.0}, x * floor),
+        ):
+            model = self._constant_estimate(value, **kwargs)
+            with self.subTest(value=value, **kwargs):
+                np.testing.assert_allclose(model(x), expected, atol=2e-5)
+                np.testing.assert_allclose(self._stream(model, x, [1280]), expected, atol=2e-5)
+        # off: what the network says
+        np.testing.assert_allclose(self._constant_estimate(0.0)(x), 0.0, atol=1e-6)
+
+    def test_step_equals_the_whole_signal_with_the_clamp(self):
+        model = ax.AudxModel(self.checkpoint, "cpu", agc_max_gain_db=0, clamp_to_input=True, max_attenuation_db=12)
+        x = self._signal(9_001, seed=13)
+        for sizes in ([1280], [1, 333, 4001, 77]):
+            with self.subTest(sizes=sizes):
+                np.testing.assert_allclose(self._stream(model, x, sizes), model(x), atol=2e-5)
+
+    def test_engine_loader_passes_the_section_9_settings(self):
+        from nemotron_testbed.audio_preprocess_runtime import make_model_loader
+        from nemotron_testbed.config import AudioPreprocessSettings
+
+        base = {"enabled": True, "model": "audx", "mode": "audx", "audx_checkpoint": str(self.checkpoint)}
+        on = make_model_loader(AudioPreprocessSettings(
+            **base, audx_agc_ceiling_dbfs=-16.0, audx_clamp_to_input=True, audx_max_attenuation_db=12.0,
+        ))("cpu")
+        self.assertAlmostEqual(on._agc_ceiling, 10 ** (-16 / 10))
+        self.assertTrue(on._clamp_to_input)
+        self.assertAlmostEqual(on._min_ratio, 10 ** (-12 / 20))
+        off = make_model_loader(AudioPreprocessSettings(**base))("cpu")
+        self.assertEqual((off._agc_ceiling, off._clamp_to_input, off._min_ratio), (None, False, None))
+
     def test_missing_file_and_unavailable_cuda(self):
         with self.assertRaises(FileNotFoundError):
             ax.AudxModel(Path(self.tmp.name) / "none.pth", "cpu")

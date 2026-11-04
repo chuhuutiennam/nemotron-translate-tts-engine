@@ -256,6 +256,9 @@ class AudioPreprocessSettings:
     audx_checkpoint: str = "models/audx/audx_weights_safe.pth"
     audx_agc_target_dbfs: float = -28.0
     audx_agc_max_gain_db: float = 30.0
+    audx_agc_ceiling_dbfs: float = 0.0  # 0 = off
+    audx_clamp_to_input: bool = False
+    audx_max_attenuation_db: float = 0.0  # 0 = no limit
 
     @property
     def delay_ms(self) -> int:
@@ -420,6 +423,16 @@ def _build_audio_preprocessing(cfg: _Cfg) -> AudioPreprocessSettings:
     agc_max_gain = cfg.float(p + "audx.agc_max_gain_db", "AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB", 30.0)
     if not (0.0 <= agc_max_gain <= 60.0):
         raise ValueError(f"{p}audx.agc_max_gain_db must be in [0, 60] (0 = AGC off), got {agc_max_gain}")
+    # docs/audx-stateful-design.md section 9: AGC ceiling, clamp of the model output
+    agc_ceiling = cfg.float(p + "audx.agc_ceiling_dbfs", "AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS", 0.0)
+    if agc_ceiling != 0.0 and not (agc_target < agc_ceiling < 0.0):
+        raise ValueError(
+            f"{p}audx.agc_ceiling_dbfs must be 0 (off) or between agc_target_dbfs={agc_target} and 0, got {agc_ceiling}"
+        )
+    clamp_to_input = cfg.bool(p + "audx.clamp_to_input", "AUDIO_PREPROCESSING_AUDX_CLAMP_TO_INPUT", False)
+    max_attenuation = cfg.float(p + "audx.max_attenuation_db", "AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB", 0.0)
+    if not (0.0 <= max_attenuation <= 60.0):
+        raise ValueError(f"{p}audx.max_attenuation_db must be in [0, 60] (0 = no limit), got {max_attenuation}")
 
     return AudioPreprocessSettings(
         enabled=enabled,
@@ -450,6 +463,9 @@ def _build_audio_preprocessing(cfg: _Cfg) -> AudioPreprocessSettings:
         audx_checkpoint=audx_checkpoint,
         audx_agc_target_dbfs=agc_target,
         audx_agc_max_gain_db=agc_max_gain,
+        audx_agc_ceiling_dbfs=agc_ceiling,
+        audx_clamp_to_input=clamp_to_input,
+        audx_max_attenuation_db=max_attenuation,
     )
 
 

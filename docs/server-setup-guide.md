@@ -614,6 +614,9 @@ Section `audio_preprocessing` trong `$SRC_DIR/etc/nemotron-engine.yaml` đã đ�
       checkpoint: models/audx/audx_weights_safe.pth
       agc_target_dbfs: -28      # AGC chỉ tăng gain; AudX hỏng tiếng nói từ -38 dBFS nếu không có AGC
       agc_max_gain_db: 30
+      agc_ceiling_dbfs: -16     # AGC không đẩy khối đang xử lý vượt mức này (docs/audx-stateful-design.md mục 9)
+      clamp_to_input: true      # model không làm bin nào to hơn đầu vào
+      max_attenuation_db: 12    # model không hạ bin nào quá 12 dB
       window:                   # window riêng của AudX (không có left/right)
         hop_ms: 80              # bội số 16 ms
         crossfade_ms: 10        # < compute_budget_ms
@@ -622,7 +625,7 @@ Section `audio_preprocessing` trong `$SRC_DIR/etc/nemotron-engine.yaml` đã đ�
 
   `bash scripts/canary_preproc.sh` với `MODEL=audx` làm sẵn `pre`, `enable`, `startup`; xem `docs/scripts-guide.md` mục 5.1.
 - **Log khởi động phải có:**
-  - `Audio preprocessing AudX ready: ... device=cuda:1 ... agc=target -28.0 dBFS max +30.0 dB`
+  - `Audio preprocessing AudX ready: ... device=cuda:1 ... agc=target -28.0 dBFS max +30.0 dB ceiling -16.0 dBFS clamp=to input, max attenuation 12.0 dB` (thiếu `ceiling` / `clamp` là yaml của `$APP_DIR` chưa có 3 key trên; `canary_preproc.sh startup` cảnh báo)
   - `Audio preprocessing runtime pool ready`
 - **Đo:**
   - Ngoài các metric ở bước 3, xem `audio_preproc_state_resets_total{reason}`: phải gần 0.

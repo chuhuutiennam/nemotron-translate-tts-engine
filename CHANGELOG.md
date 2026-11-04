@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/{audx_model,audio_preprocess_runtime,config}.py`, `etc/nemotron-engine.yaml`, the three ConfigMaps, `scripts/{probe_audx.py,canary_preproc.sh}`, `tests/{test_audx_model,test_config_yaml}.py`, `README.md`, `docs/{audx-stateful-design (status, decisions 8/9/15, 4, 8, 9 new),scripts-guide (4.6, 5.1),server-setup-guide (B, model audx),system-design}.md`: AudX AGC ceiling and clamp of the model output.
+  - **Why:** the first real `trace_pcap` from the server (2026-11-03, a clean call, 52% digital zero) showed two faults of mode `audx`:
+    - the first word of the call was cut 13–18 dB: a −61 dBFS click set the AGC level, the gain rose to +23 dB and the model got +14 dBFS peaks;
+    - soft onsets right after a pause were cut 12–37 dB by the model itself (AGC gain 0 dB there).
+    Design and offline measurements: `docs/audx-stateful-design.md` section 9.
+  - **New keys** (`audio_preprocessing.audx.*`, env `AUDIO_PREPROCESSING_AUDX_*`). Code defaults keep the old behaviour; the shipped yaml and the three ConfigMaps carry the chosen values (in the ConfigMaps they only act with `MODEL=audx`):
+    - `agc_ceiling_dbfs` (`_AGC_CEILING_DBFS`), yaml −16, default 0 = off: the AGC never lifts the block it is applied to above the ceiling. The gain drops at once at the start of that block (or part of a block within one `step()`); rising stays ramped. Must lie between `agc_target_dbfs` and 0.
+    - `clamp_to_input` (`_CLAMP_TO_INPUT`), yaml true, default false: no output bin above the input bin (input = after the AGC).
+    - `max_attenuation_db` (`_MAX_ATTENUATION_DB`), yaml 12, default 0 = no limit: no output bin cut by more than this.
+    The clamp sits after the network, before the inverse STFT, in both `step()` and the whole-signal call, so the two still agree. The "AudX ready" log line prints the ceiling and the clamp.
+  - **Tried and dropped:** dither (1/3/10 LSB) in the digital-zero runs before the model did not change the cut onsets: the model cuts onsets after any pause, not only after digital zero.
+  - **`probe_audx.py`:** `--agc-ceiling-dbfs`, `--clamp-to-input`, `--max-attenuation-db` (default off, like the code).
+  - **`canary_preproc.sh`:** `enable` with `MODEL=audx` writes the three keys; `startup` warns when the "AudX ready" line has no ceiling or clamp (the APP_DIR yaml lacks the keys); `pre` prints the probe command with the three flags. Tried on a copy of the shipped yaml without its section (`NO_RESTART=1`): the written section loads as audx 10%, D 244 ms, −16 / true / 12; `startup` on a log in the new and the old format gives OK and the warning.
+  - **Docs:** README config table, `server-setup-guide.md` (audx section and expected log line), `system-design.md` (AGC and config lists).
+  - **Verified:**
+    - pytest on Windows: 962 passed, 27 skipped (the 4 new model tests need torch). In WSL with torch, `unittest` of `test_audx_model`, `test_audio_preprocess_stateful`, `test_coordinator_audio_preprocess`, `test_config_yaml`: 170 OK.
+    - New tests: a click then a −22 dBFS block stays at or below the ceiling, whole blocks and blocks split across calls; a block louder than the ceiling keeps gain 1; a ceiling that never binds changes nothing; with a constant network output the clamp gives back the input or the input −12 dB, in both paths; `step()` equals the whole-signal call with the clamp on; the engine loader passes the three values; config yaml / env / bad values; shipped yaml and ConfigMaps.
+    - The repo code on the trace (WSL CPU, real checkpoint `af98dfec…`) gives the same 16-bit output as the offline prototype (0 LSB difference): first word −14.6 → −2.8 dB, worst onset after a pause −28.6 → −12.0 dB, loud speech −1.0 → −1.2 dB, below 300 Hz +4.4 → −2.4 dB, peak into the model +14.8 → −2.6 dBFS. Pink noise (9 conditions) and clean speech also match the prototype: SI-SDR mean 10.2 dB (10.4 before), clean speech 16.5 → 21.4 dB.
+    - Speed unchanged: stream RTF on `banking_trouble.wav` (WSL CPU, 3 alternated runs) 0.053–0.063 off, 0.052–0.064 on.
+  - **Not yet done:** WER of mode `audx` (design section 6); the server's own yaml in APP_DIR needs the three keys copied by hand. AudX still degrades clean speech (SNR above ~20 dB): section 9.6.
+
 - `scripts/kaggle/{setup_kaggle.sh,run_tests_kaggle.sh,check_mel.py (new),kaggle_asr_feature_fix.ipynb}`, `docs/{local-cpu-test-design (new),scripts-guide (0, 8, 8.3, 8.4 new),asr-feature-fix-design (6, 7, 10)}.md`: the Kaggle test scripts also run on a CPU-only Linux machine (`DEVICE=cpu`).
   - **Why:** user request. An Ubuntu machine without a GPU (32 GB RAM, NeMo allowed) must run the local tests instead of Kaggle: pytest, the real mel check, and WER A/F of the ASR input fix. Both scripts stopped without a GPU, although the engine itself already runs on the CPU (`k8s-configmap-cpu.yaml`). Design agreed in `docs/local-cpu-test-design.md`.
   - **Switch:** `DEVICE`, an env of the scripts.

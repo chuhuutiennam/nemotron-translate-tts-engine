@@ -138,7 +138,7 @@ raise SystemExit(0 if torch.cuda.is_available() else 3)"; then
     info "YAML đã có section audio_preprocessing:"
     awk '/^[^[:space:]#]/ { b = ($0 ~ /^audio_preprocessing:/) } b' "$CFG"
   fi
-  info "đo nhanh trên máy này: cd $REPO_DIR && PYTHONPATH=src $PYTHON scripts/probe_audx.py <wav> --checkpoint $ckpt --device cuda:1 --narrowband --no-window"
+  info "đo nhanh trên máy này: cd $REPO_DIR && PYTHONPATH=src $PYTHON scripts/probe_audx.py <wav> --checkpoint $ckpt --device cuda:1 --narrowband --no-window --agc-ceiling-dbfs -16 --clamp-to-input --max-attenuation-db 12"
   gpu_snapshot
   return $rc
 }
@@ -203,6 +203,10 @@ audio_preprocessing:
     checkpoint: $AUDX_CHECKPOINT
     agc_target_dbfs: -28
     agc_max_gain_db: 30
+    # docs/audx-stateful-design.md mục 9: trần AGC, model không làm bin nào to hơn đầu vào, hạ tối đa 12 dB
+    agc_ceiling_dbfs: -16
+    clamp_to_input: true
+    max_attenuation_db: 12
     # AudX có trạng thái theo stream: hop 80 + look-ahead 64 + budget 100 -> D = 244 ms
     window:
       hop_ms: 80
@@ -276,6 +280,11 @@ cmd_startup() {
       if [[ "$MODEL" == audx ]]; then
         if [[ "$ready" == *"device=cuda"* ]]; then ok "AudX chạy trên GPU: $ready"
         else warn "dòng 'AudX ready' không có device=cuda: $ready"; fi
+        if [[ "$ready" == *"ceiling -"* && "$ready" == *"clamp=to input, max attenuation"* ]]; then
+          ok "AudX có trần AGC và kẹp đầu ra (docs/audx-stateful-design.md mục 9)"
+        else
+          warn "dòng 'AudX ready' thiếu trần AGC hoặc kẹp: thêm audx.agc_ceiling_dbfs / clamp_to_input / max_attenuation_db vào $CFG"
+        fi
       elif [[ "$ready" == *CUDAExecutionProvider* ]]; then ok "denoiser resemble chạy CUDAExecutionProvider"
       else warn "dòng 'denoiser ready' không có CUDAExecutionProvider: $ready"; fi ;;
     *AUDIO_PREPROCESSING_DISABLED*)

@@ -4,6 +4,8 @@
 
 Trạng thái: đã duyệt và đã code 2026-10-30 (phương án B, có AGC; đo WER để sau). Trong code và ConfigMap `enabled` mặc định vẫn là `false`; `etc/nemotron-engine.yaml` phát hành bật `model: audx` cho 100% stream (user chọn 2026-10-30, để thử). Chưa đo WER tiếng Việt và chưa đo trên GPU.
 
+2026-11-04: trace cuộc gọi thật đầu tiên cho thấy AGC đẩy chữ đầu cuộc gọi vượt mức tối đa và model hạ mạnh âm đầu sau khoảng lặng. User chốt sửa: trần AGC + kẹp đầu ra model (chặn tăng, sàn −12 dB), đã kiểm offline và **đã code cùng ngày** (mục 9). Yaml của APP_DIR trên server chưa có 3 key mới.
+
 Số đo sau khi code (WSL CPU, 2 thread, đường G.711):
 
 | | Kết quả |
@@ -149,7 +151,8 @@ Từ chunk thứ 4 trở đi, mỗi chunk 80 ms nhận vào cho ra đúng 80 ms 
    - Gain = clip(√(target/mức), 1, max) với target −28 dBFS, max +30 dB. Gain đổi tuyến tính trong mỗi block.
    - Đầu ra chia lại đúng gain đã nhân, nên mức ra bằng mức vào.
    - `agc_max_gain_db: 0` tắt AGC.
-9. **Đoạn số 0 dài** (≥ `zero_run_min_samples`): vẫn đưa vào model để liền mạch thời gian; đầu ra ở đó ép về 0. Không dùng dither.
+   - Trần `agc_ceiling_dbfs` (2026-11-04, mục 9.2): gain không được đẩy khối đang xử lý vượt trần.
+9. **Đoạn số 0 dài** (≥ `zero_run_min_samples`): vẫn đưa vào model để liền mạch thời gian; đầu ra ở đó ép về 0. Không dùng dither (2026-11-04 đã thử dither 1/3/10 LSB: không đổi gì, mục 9.3).
 10. **flush:**
     - Chờ job đang chạy, gửi job cuối (`final`) để xả 64 ms còn giữ trong model.
     - Phát đến mẫu cuối mà không crossfade về raw, vì sau đó không còn gì. Thiếu kết quả thì vẫn phát raw.
@@ -163,6 +166,7 @@ Từ chunk thứ 4 trở đi, mỗi chunk 80 ms nhận vào cho ra đúng 80 ms 
     - Nhãn `backend="audx"`.
     - Counter mới `audio_preproc_state_resets_total{backend,reason}`.
     - STATS cộng theo mọi backend (mỗi process chỉ chạy một backend).
+15. **Kẹp đầu ra model** (2026-11-04, mục 9.4): mỗi bin STFT, biên độ model đoán nằm trong [|X|·10^(−`max_attenuation_db`/20), |X|] với X là biên độ vào model (sau AGC). Áp cho cả `step()` và đường chạy cả file.
 
 ## 4. Config
 
@@ -175,6 +179,9 @@ audio_preprocessing:
     checkpoint: models/audx/audx_weights_safe.pth   # AUDIO_PREPROCESSING_AUDX_CHECKPOINT
     agc_target_dbfs: -28                            # AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS
     agc_max_gain_db: 30                             # AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB (0 = tắt)
+    agc_ceiling_dbfs: -16                           # AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS (0 = tắt; mục 9.2)
+    clamp_to_input: true                            # AUDIO_PREPROCESSING_AUDX_CLAMP_TO_INPUT (mục 9.4)
+    max_attenuation_db: 12                          # AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB (0 = không giới hạn; mục 9.4)
     window:                 # riêng của AudX: không có left/right (look-ahead cố định 64 ms)
       hop_ms: 80            # AUDIO_PREPROCESSING_AUDX_HOP_MS: chu kỳ gửi job, bội số 16 ms; 0 = 80
       crossfade_ms: 10      # AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS: < compute_budget_ms
@@ -267,3 +274,88 @@ Chi tiết tham số: `docs/scripts-guide.md` mục 1.5. Muốn xem mọi phase 
 - Gộp nhiều stream thành một batch trên GPU.
 - Đo WER theo mục 6 (user để sau); bước đo audx trên Kaggle; công cụ trộn nhiễu cho `eval_wer.py`.
 - Bật trong ConfigMap. Yaml phát hành đã bật audx cho 100% stream từ 2026-10-30; trong code mặc định vẫn tắt.
+- Chép 3 key mục 9 vào yaml của APP_DIR trên server, restart, xem dòng log "AudX ready" có `ceiling -16.0 dBFS` và `clamp=to input, max attenuation 12.0 dB`.
+- Chỉ chạy AudX khi cuộc gọi đủ ồn (mục 9.6): chưa bàn.
+
+## 9. Sửa AGC và kẹp đầu ra model (chốt và code 2026-11-04)
+
+### 9.1 Vấn đề thấy trên trace thật
+
+Trace `trace_pcap` đầu tiên trên server (cuộc gọi 2026-11-03, leg `BVnGD…`, 63,6 s, `docs/trace-pcap-design.md`). Không có vùng late / shed / error, nên luồng `audx` đúng là đầu ra AudX.
+
+- Cuộc gọi sạch: 52% thời lượng là số 0 tuyệt đối (khoảng lặng đã bị ép về 0 trước engine), tiếng nói khoảng −20 dBFS.
+- Tiếng nói to giữ mức (−1 dB), nhưng:
+  - **Chữ đầu cuộc gọi** (5,64 s) bị hạ 13–18 dB. AGC lấy mức nền theo khối đầu tiên vượt −65 dBFS, ở đây là một tiếng lách tách −61 dBFS (4,86 s), nên gain lên +23 dB và giữ tới khi có tiếng nói; model nhận đỉnh +14 dBFS. Đã tính lại AGC đúng như code để xác nhận.
+  - **Âm đầu nhỏ ngay sau khoảng lặng**: khung −40…−30 dBFS trong 40 ms đầu sau đoạn số 0 bị hạ trung vị 12 / 7,5 dB, tệ nhất 25–37 dB (9,16 / 13,42 / 14,72 / 39,70 s). Cùng mức đó nhưng cách khoảng lặng hơn 300 ms chỉ −1,5 dB. Ở những chỗ này gain AGC là 0 dB, tức chính model hạ.
+  - Model thêm 3–10 dB dưới 300 Hz và hạ 2,7 dB ở 2–4 kHz.
+
+### 9.2 Trần AGC (`agc_ceiling_dbfs`)
+
+- Gain của một khối 20 ms không vượt max(1, √(trần / công suất của chính khối đó)). Khối đã có sẵn trong lần `step()` nên không thêm độ trễ. Khối vắt qua 2 lần `step()` thì mỗi phần tính trên phần của nó.
+- Gain giảm ngay từ đầu khối, không ramp xuống. Tăng lại vẫn ramp như cũ. τ, đích −28 dBFS và max +30 dB giữ nguyên (quyết định 8).
+- Trần −16 dBFS: mức to nhất mà model còn tốt (mục 1). `0` = tắt. Khác 0 thì phải lớn hơn `agc_target_dbfs` và nhỏ hơn 0.
+- Không chỉ đầu cuộc gọi: ở cuộc gọi ồn, vài giây chỉ có ồn kéo mức nền xuống bằng mức ồn, gain lên khoảng +20 dB, và âm tiết đầu sau mỗi khoảng lặng bị đẩy quá mức. Đã tái hiện offline (mục 9.5).
+
+### 9.3 Dither đoạn số 0 (đã thử, bỏ)
+
+Thay đoạn số 0 dài bằng nhiễu 1 / 3 / 10 LSB trước model, đầu ra ở đó vẫn ép về 0. Âm đầu sau khoảng lặng vẫn bị hạ như cũ: model hạ âm đầu sau mọi khoảng lặng, không riêng sau số 0. Không làm.
+
+### 9.4 Kẹp đầu ra model (`clamp_to_input`, `max_attenuation_db`)
+
+- Với mỗi bin STFT, gọi X là biên độ vào model (sau AGC) và Y là biên độ model đoán:
+  - `clamp_to_input: true`: Y ≤ |X|. Bỏ phần năng lượng model tự thêm (dưới 300 Hz; dải 4–8 kHz khi đầu vào là băng điện thoại).
+  - `max_attenuation_db: 12`: Y ≥ |X| · 10^(−12/20). Âm đầu mất tối đa 12 dB; khử ồn cũng bị giới hạn 12 dB mỗi bin. `0` = không giới hạn.
+- Áp ngay sau lớp FC, trước iSTFT, ở cả `_synthesise` (`step()`) và `__call__` (chạy cả file), để hai đường vẫn cho cùng kết quả.
+- Mức sàn chọn theo đánh đổi ở mục 9.5. Sàn −12 dB cho khử ồn ngang bản hiện tại; muốn khử ồn mạnh hơn ở cuộc gọi rất ồn thì hạ sàn (−18 dB). Chỉnh lại theo WER (mục 6).
+
+### 9.5 Kiểm chứng offline
+
+Harness tạm (không nằm trong repo) gọi `AudxModel.step()` từng 80 ms như engine, ép số 0 như `StatefulStreamPreprocessor`, CPU trong WSL. Bản không sửa khớp luồng `audx` của server với SNR 73 dB (chỉ khác ở mức làm tròn 16-bit). Nhiễu hồng: tiếng nói `friend.wav` + `banking_trouble.wav` (117 s) ở −16 / −26 / −36 dBFS × SNR 0 / 5 / 10 dB, qua đường G.711 (sinc). SI-SDR so với tiếng sạch cùng đường G.711.
+
+| | Hiện tại | Trần AGC | Trần + chặn tăng | **Trần + chặn tăng + sàn −12 dB (chốt)** |
+|---|---|---|---|---|
+| Trace: chữ đầu 5,64 s (60 ms đầu) | −14,6 dB | −2,5 | −2,8 | −2,8 |
+| Trace: âm đầu sau lặng, chỗ tệ nhất | −28,6 dB | −28,6 | −29,8 | −12,0 |
+| Trace: khung −40…−30 dBFS ≤ 40 ms sau lặng, p10 | −25,1 dB | −25,1 | −28,6 | −12,0 |
+| Trace: tiếng nói ≥ −30 dBFS (trung vị) | −1,0 dB | −1,0 | −1,2 | −1,2 |
+| Trace: dưới 300 Hz | +4,4 dB | +4,4 | −2,1 | −2,4 |
+| Trace: đỉnh vào model | +14,8 dBFS | −2,6 | −2,6 | −2,6 |
+| Nhiễu hồng, SI-SDR trung bình 9 điều kiện (đầu vào 4,2) | 10,4 | 10,4 | 11,4 | 10,2 |
+| Tiếng sạch −26 dBFS / SNR 30 dB, SI-SDR (đầu vào ∞ / 28,3) | 16,5 / 17,9 | 16,7 / 18,1 | 21,0 / 21,7 | 21,4 / 21,9 |
+
+- Mức sàn khác (cùng trần + chặn tăng), SI-SDR nhiễu trung bình: −6 dB 7,6; −9 dB 9,1; −18 dB 11,1. Âm đầu tệ nhất trên trace bằng đúng mức sàn.
+- Trần AGC với 6 s chỉ có ồn hồng −50 dBFS rồi mới nói −20 dBFS (6 lần): đỉnh vào model +11,3 → 0 dBFS, SI-SDR mỗi đoạn nói 17,2 → 18,4 dB.
+- Trần AGC không đổi kết quả nào ở 9 điều kiện nhiễu hồng: chỉ có tác dụng khi gain đang cao mà khối to.
+- Sau khi code, `probe_audx.py` có cờ cho 3 key để đo lại trên máy có model.
+
+### 9.6 Giới hạn còn lại: AudX làm méo tiếng nói sạch
+
+- Tiếng sạch qua AudX chỉ còn SI-SDR 16,5 dB (hiện tại) / 21,4 dB (sau sửa). Ở SNR 30 dB: đầu vào 28,3 → 17,9 / 21,9. Hoà ở khoảng SNR 20 dB; sạch hơn mức đó thì đầu ra tệ hơn đầu vào.
+- Không do đường điện thoại: tiếng sạch băng rộng (đúng loại dữ liệu model được train) cũng chỉ 16,3 dB. Khớp với số của notebook train trên tập test VoiceBank-DEMAND: đầu ra SI-SDR 16,24 dB (`docs/AudX_Streaming_Telecom_POC/README_AUDX_INTEGRATION.md`).
+- Nguyên nhân: model không trừ nhiễu khỏi đầu vào mà đoán lại biên độ của mọi bin, kể cả khi không có nhiễu.
+  - Trên tiếng sạch, trung vị mỗi bin chỉ −1…−2 dB, nhưng 10% bin bị hạ hơn 11–16 dB, kể cả bin mạnh nhất của khung.
+  - Bản hiện tại còn tự thêm năng lượng: 34–37% sai số biên độ là bin bị tăng.
+  - Model được train trên VoiceBank-DEMAND, chỉ có SNR 0–15 dB, nên chưa từng thấy đầu vào sạch.
+- Chặn tăng bỏ được phần năng lượng tự thêm. Phần hạ sai còn lại là giới hạn của model; cấu hình không sửa được.
+- Hướng sau (chưa bàn): chỉ chạy AudX khi ước lượng SNR của cuộc gọi đủ thấp, hoặc train lại có cả dữ liệu sạch. Ảnh hưởng thật lên ASR phải đo bằng WER (mục 6).
+
+### 9.7 Đã code (2026-11-04)
+
+| File | Thay đổi |
+|---|---|
+| `audx_model.py` | `AudxModel(..., agc_ceiling_dbfs=0, clamp_to_input=False, max_attenuation_db=0)`; trần trong `_agc`; kẹp trong `_synthesise` và `__call__`; dòng log "AudX ready" in thêm 3 giá trị |
+| `audio_preprocess_runtime.py` | Truyền 3 giá trị từ settings |
+| `config.py` | 3 key `audx.*` + env `AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS` / `_CLAMP_TO_INPUT` / `_MAX_ATTENUATION_DB`; kiểm tra giá trị; mặc định code = tắt (hành vi như hiện tại) |
+| `etc/nemotron-engine.yaml` | −16 / true / 12. Yaml của APP_DIR trên server phải chép tay 3 key |
+| 3 ConfigMap | 3 env = −16 / true / 12, như các key audx khác (giá trị khuyến nghị; chỉ có tác dụng khi ConfigMap chọn `MODEL=audx`, nên đổi model không phải sửa số) |
+| `scripts/probe_audx.py` | `--agc-ceiling-dbfs`, `--clamp-to-input`, `--max-attenuation-db` |
+| Test | Trần: tiếng lách tách rồi khối to thì gain bị chặn, model không nhận quá trần; tắt thì gain giống hệt cũ. Kẹp: Y nằm trong khoảng; `step()` bằng chạy cả file khi bật kẹp (AGC tắt). Config: yaml, env, giá trị sai bị từ chối. Yaml phát hành có 3 giá trị |
+| `scripts/canary_preproc.sh` | `enable` (`MODEL=audx`) ghi thêm 3 key; `startup` cảnh báo khi dòng "AudX ready" thiếu trần / kẹp; `pre` in lệnh probe có 3 cờ |
+| Docs | Mục này, `scripts-guide.md` (4.6 probe_audx, 5.1 canary), `README.md` (bảng config), `server-setup-guide.md` (section audx, dòng log), `system-design.md`, `CHANGELOG.md` |
+
+Kiểm tra sau khi code:
+- pytest Windows: 962 pass, 27 skip (4 test model mới cần torch). WSL có torch, `unittest` 4 file AudX / preprocessor / config: 170 OK.
+- Khối vắt qua 2 lần `step()`: mỗi phần bị chặn theo công suất của chính nó, và gain giữ mức chặn thấp nhất tới hết khối. Vì vậy khối có thể nằm dưới trần một chút (test thấy −17,5 dBFS khi phần đầu chỉ 44 mẫu) nhưng không bao giờ vượt trần. Chunk 80 ms của rtpgw khớp lưới 20 ms, nên chỉ gặp khi RTP chèn im lặng.
+- Code trong repo chạy trên trace cho đầu ra 16-bit trùng bản thử offline (lệch 0 LSB), các số trace ở mục 9.5 giữ nguyên; nhiễu hồng 9 điều kiện cũng trùng (trung bình 10,2).
+- Tốc độ không đổi: RTF lượt stream 80 ms trên `banking_trouble.wav` (WSL CPU, 3 lượt xen kẽ) tắt 0,053–0,063, bật 0,052–0,064.
+- `probe_audx.py` với 3 cờ chạy được trên `friend.wav` (G.711): tiếng nói −0,4 dB, khoảng lặng −9,4 dB, dải ≥ 4 kHz −3,0 dB; không cờ: +1,3 / −5,5 / **+20,8** dB (model tự tạo dải trên 4 kHz khi đầu vào là băng điện thoại).

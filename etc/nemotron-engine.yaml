@@ -171,6 +171,9 @@ audio_preprocessing:
     checkpoint: models/audx/audx_weights_safe.pth  # AUDIO_PREPROCESSING_AUDX_CHECKPOINT  (state_dict hoặc {'state_dict': ...} của POC)
     agc_target_dbfs: -28                 # AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS  (AGC chỉ tăng gain: tiếng nói nhỏ hơn mức này được nâng lên trước model rồi trả lại sau; AudX tệ đi khi tiếng nói <= -38 dBFS)
     agc_max_gain_db: 30                  # AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB  (0 = tắt AGC)
+    agc_ceiling_dbfs: -16                # AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS  (0 = tắt; AGC không đẩy khối đang xử lý vượt mức này, giữ chữ đầu cuộc gọi và âm đầu sau khoảng lặng có ồn; phải > agc_target_dbfs; docs/audx-stateful-design.md mục 9)
+    clamp_to_input: true                 # AUDIO_PREPROCESSING_AUDX_CLAMP_TO_INPUT  (true = model không làm bin nào to hơn đầu vào: bỏ phần năng lượng model tự thêm)
+    max_attenuation_db: 12               # AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB  (0 = không giới hạn; model không hạ bin nào quá mức này: âm đầu sau khoảng lặng mất tối đa 12 dB, khử ồn cũng tối đa 12 dB)
     window:                              # không có left/right: look-ahead cố định 64 ms theo model; D = hop + 64 + budget
       hop_ms: 80                         # AUDIO_PREPROCESSING_AUDX_HOP_MS  (chu kỳ gửi audio cho model, bội số 16 ms; 0 = 80)
       crossfade_ms: 10                   # AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS  (chuyển raw <-> enhanced; < compute_budget_ms)

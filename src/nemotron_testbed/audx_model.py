@@ -10,7 +10,8 @@ The chain reproduces training and the reference inference:
   * network input: raw linear magnitude, (frames x 257), no log and no level normalisation,
   * network: Conv2d 1->16 3x3, ReLU, Conv2d 16->32 3x3, ReLU (both padded in time and frequency),
     per frame the 32 channels x 257 bins are flattened channel-major into a 2-layer LSTM (256 units,
-    one direction), Linear 256 -> 257 predicts the clean magnitude (unbounded: no clamp, as the reference),
+    one direction), Linear 256 -> 257 predicts the clean magnitude (unbounded like the reference, unless
+    clamp_to_input / max_attenuation_db keep it within [input x 10^(-dB/20), input] per bin),
   * the noisy phase is kept and an inverse STFT returns exactly as many samples as it was given.
 Look-ahead: the centred 512-sample frame (32 ms) plus one frame per 3x3 conv (2 x 16 ms) = 64 ms.
 
@@ -19,7 +20,9 @@ Two ways to run it:
   * AudxModel.step(state, samples): one stream piece by piece; the LSTM state, the last STFT frames and the
     overlap-add tail live in AudxStreamState, so the concatenated output equals the whole-signal output.
 The level matters (no normalisation inside the model: speech at -38 dBFS already comes out worse than it went
-in), so step() runs a boost-only AGC before the model and divides the same gain out of its output.
+in), so step() runs a boost-only AGC before the model and divides the same gain out of its output. With
+agc_ceiling_dbfs the AGC never pushes the block it is applied to above that level (docs/audx-stateful-design.md
+section 9).
 """
 
 from __future__ import annotations
@@ -170,6 +173,9 @@ class AudxModel:
         *,
         agc_target_dbfs: float = -28.0,
         agc_max_gain_db: float = 30.0,
+        agc_ceiling_dbfs: float = 0.0,
+        clamp_to_input: bool = False,
+        max_attenuation_db: float = 0.0,
     ) -> None:
         checkpoint = Path(checkpoint)
         if not checkpoint.is_file():
@@ -205,14 +211,28 @@ class AudxModel:
         self._agc_max = 10.0 ** (agc_max_gain_db / 20.0)
         self._agc_alpha = math.exp(-AGC_BLOCK / SAMPLE_RATE / AGC_TAU_S)
         self._agc_floor = 10.0 ** (AGC_FLOOR_DBFS / 10.0)
+        # 0 = off for both: no ceiling on the boosted block, no limit on how far a bin may be cut
+        self._agc_ceiling = 10.0 ** (agc_ceiling_dbfs / 10.0) if agc_ceiling_dbfs != 0.0 else None
+        self._clamp_to_input = bool(clamp_to_input)
+        self._min_ratio = 10.0 ** (-max_attenuation_db / 20.0) if max_attenuation_db > 0.0 else None
         self.sha256 = file_sha256(checkpoint)
+        agc = "off"
+        if agc_max_gain_db > 0:
+            ceiling = f"{agc_ceiling_dbfs} dBFS" if self._agc_ceiling is not None else "off"
+            agc = f"target {agc_target_dbfs} dBFS max +{agc_max_gain_db} dB ceiling {ceiling}"
+        clamp = []
+        if self._clamp_to_input:
+            clamp.append("to input")
+        if self._min_ratio is not None:
+            clamp.append(f"max attenuation {max_attenuation_db} dB")
         logger.info(
-            "Audio preprocessing AudX ready: checkpoint=%s sha256=%s device=%s meta=%s agc=%s",
+            "Audio preprocessing AudX ready: checkpoint=%s sha256=%s device=%s meta=%s agc=%s clamp=%s",
             checkpoint,
             self.sha256,
             device,
             meta,
-            f"target {agc_target_dbfs} dBFS max +{agc_max_gain_db} dB" if agc_max_gain_db > 0 else "off",
+            agc,
+            ", ".join(clamp) or "off",
         )
 
     @staticmethod
@@ -267,7 +287,11 @@ class AudxModel:
         return out.astype(np.float32, copy=False)
 
     def _agc(self, state: AudxStreamState, x: np.ndarray) -> np.ndarray | None:
-        """Per-sample gain for x, decided from earlier 20 ms blocks only, ramped across each block."""
+        """Per-sample gain for x, decided from earlier 20 ms blocks only, ramped across each block.
+
+        With a ceiling, the gain also never lifts the block it is applied to (the part of it in x) above the
+        ceiling: it drops at once, at the start of that part, and rises again ramped as usual.
+        """
         if self._agc_max <= 1.0:
             return None
         gains = np.empty(x.size, dtype=np.float32)
@@ -281,10 +305,15 @@ class AudxModel:
                     1.0 if level <= 0.0 else min(max(math.sqrt(self._agc_target / level), 1.0), self._agc_max)
                 )
             take = min(AGC_BLOCK - offset, x.size - i)
+            seg = x[i : i + take].astype(np.float64)
+            energy = float(np.dot(seg, seg))
+            if self._agc_ceiling is not None and energy > 0.0:
+                cap = max(math.sqrt(self._agc_ceiling * take / energy), 1.0)
+                state.agc_from = min(state.agc_from, cap)
+                state.agc_to = min(state.agc_to, cap)
             ramp = np.arange(offset + 1, offset + take + 1, dtype=np.float64) / AGC_BLOCK
             gains[i : i + take] = state.agc_from + (state.agc_to - state.agc_from) * ramp
-            seg = x[i : i + take].astype(np.float64)
-            state.agc_power += float(np.dot(seg, seg))
+            state.agc_power += energy
             if offset + take == AGC_BLOCK:
                 power = state.agc_power / AGC_BLOCK
                 state.agc_power = 0.0
@@ -323,6 +352,10 @@ class AudxModel:
             estimate = self.net.fc(seq).float().cpu().numpy()  # (n, F)
         noisy = state.spectra[state.next_frame - base : ready - base]
         size = np.abs(noisy)
+        if self._clamp_to_input:
+            estimate = np.minimum(estimate, size)
+        if self._min_ratio is not None:
+            estimate = np.maximum(estimate, size * np.float32(self._min_ratio))
         phase = np.where(size > 0.0, noisy / np.maximum(size, 1e-30), 1.0)  # angle(0) = 0 as torch.angle
         frames = np.fft.irfft(estimate * phase, n=N_FFT, axis=1).astype(np.float32) * self._np_window
         n = ready - state.next_frame
@@ -386,7 +419,12 @@ class AudxModel:
                 pad_mode="constant",
                 return_complex=True,
             )  # (F, T)
-            estimate = self.net(spec.abs().T.unsqueeze(0))[0].T  # (F, T), may be negative like the reference
+            size = spec.abs()
+            estimate = self.net(size.T.unsqueeze(0))[0].T  # (F, T), may be negative like the reference
+            if self._clamp_to_input:
+                estimate = torch.minimum(estimate, size)
+            if self._min_ratio is not None:
+                estimate = torch.maximum(estimate, size * self._min_ratio)
             phase = torch.angle(spec)
             enhanced = torch.complex(estimate * torch.cos(phase), estimate * torch.sin(phase))
             y = torch.istft(

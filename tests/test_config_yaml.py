@@ -864,21 +864,28 @@ class TestSettingsFromFileOrEnv(unittest.TestCase):
         self.assertEqual(p.delay_ms, 244)
         self.assertEqual(p.audx_checkpoint, "models/audx/audx_weights_safe.pth")
         self.assertEqual((p.audx_agc_target_dbfs, p.audx_agc_max_gain_db), (-28.0, 30.0))
+        # section 9 fixes: off unless set (behaviour before 2026-11-04)
+        self.assertEqual((p.audx_agc_ceiling_dbfs, p.audx_clamp_to_input, p.audx_max_attenuation_db), (0.0, False, 0.0))
         p = self._preproc({
             "enabled": True,
             "model": "audx",
             "audx": {
                 "checkpoint": "m/a.pth", "agc_target_dbfs": -30, "agc_max_gain_db": 0,
+                "agc_ceiling_dbfs": -20, "clamp_to_input": True, "max_attenuation_db": 9,
                 "window": {"hop_ms": 160, "compute_budget_ms": 60, "crossfade_ms": 20},
             },
         })
         self.assertEqual((p.audx_checkpoint, p.audx_agc_target_dbfs, p.audx_agc_max_gain_db), ("m/a.pth", -30.0, 0.0))
+        self.assertEqual((p.audx_agc_ceiling_dbfs, p.audx_clamp_to_input, p.audx_max_attenuation_db), (-20.0, True, 9.0))
         self.assertEqual((p.hop_ms, p.crossfade_ms, p.delay_ms), (160, 20, 160 + 64 + 60))
         p = self._preproc(
             AUDIO_PREPROCESSING_MODEL="AudX",
             AUDIO_PREPROCESSING_AUDX_CHECKPOINT="/opt/audx.pth",
             AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS="-26",
             AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB="20",
+            AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS="-18",
+            AUDIO_PREPROCESSING_AUDX_CLAMP_TO_INPUT="true",
+            AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB="15",
             AUDIO_PREPROCESSING_AUDX_HOP_MS="96",
             AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS="8",
             AUDIO_PREPROCESSING_AUDX_COMPUTE_BUDGET_MS="50",
@@ -890,6 +897,7 @@ class TestSettingsFromFileOrEnv(unittest.TestCase):
             (p.mode, p.audx_checkpoint, p.audx_agc_target_dbfs, p.audx_agc_max_gain_db),
             ("audx", "/opt/audx.pth", -26.0, 20.0),
         )
+        self.assertEqual((p.audx_agc_ceiling_dbfs, p.audx_clamp_to_input, p.audx_max_attenuation_db), (-18.0, True, 15.0))
         self.assertEqual((p.hop_ms, p.crossfade_ms, p.compute_budget_ms, p.delay_ms), (96, 8, 50, 96 + 64 + 50))
 
     def test_audio_preprocessing_switching_model_needs_no_other_change(self):
@@ -911,6 +919,11 @@ class TestSettingsFromFileOrEnv(unittest.TestCase):
              "< compute_budget_ms"),
             ({"AUDIO_PREPROCESSING_AUDX_AGC_TARGET_DBFS": "-3"}, "agc_target_dbfs"),
             ({"AUDIO_PREPROCESSING_AUDX_AGC_MAX_GAIN_DB": "-1"}, "agc_max_gain_db"),
+            # the ceiling must sit between the AGC target (-28 by default) and 0 dBFS
+            ({"AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS": "-28"}, "agc_ceiling_dbfs"),
+            ({"AUDIO_PREPROCESSING_AUDX_AGC_CEILING_DBFS": "3"}, "agc_ceiling_dbfs"),
+            ({"AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB": "-1"}, "max_attenuation_db"),
+            ({"AUDIO_PREPROCESSING_AUDX_MAX_ATTENUATION_DB": "61"}, "max_attenuation_db"),
             ({"AUDIO_PREPROCESSING_ENABLED": "true", "AUDIO_PREPROCESSING_AUDX_CHECKPOINT": ""}, "audx.checkpoint"),
         ):
             with self.subTest(env=env), self.assertRaisesRegex(ValueError, message):
@@ -1100,6 +1113,8 @@ class TestSettingsFromFileOrEnv(unittest.TestCase):
         self.assertEqual(p.delay_ms, 244)
         self.assertEqual(p.audx_checkpoint, "models/audx/audx_weights_safe.pth")
         self.assertEqual((p.audx_agc_target_dbfs, p.audx_agc_max_gain_db), (-28.0, 30.0))
+        # 2026-11-04 (docs/audx-stateful-design.md section 9): AGC ceiling, clamp to input, 12 dB floor
+        self.assertEqual((p.audx_agc_ceiling_dbfs, p.audx_clamp_to_input, p.audx_max_attenuation_db), (-16.0, True, 12.0))
 
     def test_kaggle_overlay_keeps_audio_preprocessing_off(self):
         # run_tests_kaggle.sh deep-merges scripts/kaggle/kaggle-engine.yaml onto the shipped yaml (make_config);
@@ -1157,6 +1172,10 @@ class TestSettingsFromFileOrEnv(unittest.TestCase):
                 # switching only the model gives AudX its own window (no D = 344 ms from the denoiser values)
                 audx = load({**env, "AUDIO_PREPROCESSING_MODEL": "audx"})
                 self.assertEqual((audx.mode, audx.crossfade_ms, audx.delay_ms), ("audx", 10, 244))
+                self.assertEqual(
+                    (audx.audx_agc_ceiling_dbfs, audx.audx_clamp_to_input, audx.audx_max_attenuation_db),
+                    (-16.0, True, 12.0),
+                )
 
     # ── grpc keepalive / ping policy ──────────────────────────────────────────
 

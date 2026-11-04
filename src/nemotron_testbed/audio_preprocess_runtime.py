@@ -36,6 +36,9 @@ def make_model_loader(settings: AudioPreprocessSettings) -> ModelLoader:
                 device,
                 agc_target_dbfs=settings.audx_agc_target_dbfs,
                 agc_max_gain_db=settings.audx_agc_max_gain_db,
+                agc_ceiling_dbfs=settings.audx_agc_ceiling_dbfs,
+                clamp_to_input=settings.audx_clamp_to_input,
+                max_attenuation_db=settings.audx_max_attenuation_db,
             )
         return load_window_model(
             settings.mode,

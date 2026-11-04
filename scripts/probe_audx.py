@@ -13,8 +13,12 @@ through the G.711 path the engine gets from rtpgw) it reports:
   * windowed vs whole file (unless --no-window): the engine's StreamAudioPreprocessor with the given
     window (left/hop/right ms), results delivered at once, compared with the whole-file pass,
   * stream (what mode audx runs): AudxModel.step() over --piece-ms pieces with the AGC of
-    --agc-target-dbfs / --agc-max-gain-db (0 = off): speed, speech level change, SNR vs the whole-file
-    pass (no AGC there, so only close when the AGC does not boost), and the level dependence with the AGC.
+    --agc-target-dbfs / --agc-max-gain-db (0 = off) / --agc-ceiling-dbfs (0 = off): speed, speech level change,
+    SNR vs the whole-file pass (no AGC there, so only close when the AGC does not boost), and the level
+    dependence with the AGC.
+--clamp-to-input and --max-attenuation-db (0 = no limit) clamp the model output in every pass, as the engine keys
+audx.clamp_to_input / audx.max_attenuation_db do (docs/audx-stateful-design.md section 9). All of them default to
+off: pass the values of the yaml to measure what the engine runs.
 --out writes <name>_in.wav, <name>_audx.wav, <name>_audx_windowed.wav and <name>_audx_stream.wav to listen to.
 
 Needs torch (CPU is enough), numpy, soxr (non-16 kHz WAV, --narrowband), prometheus_client and pyyaml
@@ -151,6 +155,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--piece-ms", type=int, default=80, help="stream pass: audio per step (engine hop_ms)")
     parser.add_argument("--agc-target-dbfs", type=float, default=-28.0)
     parser.add_argument("--agc-max-gain-db", type=float, default=30.0, help="0 = stream pass without AGC")
+    parser.add_argument("--agc-ceiling-dbfs", type=float, default=0.0,
+                        help="AGC never lifts the block it is applied to above this (0 = off; yaml -16)")
+    parser.add_argument("--clamp-to-input", action="store_true",
+                        help="no output bin above the input bin (yaml audx.clamp_to_input)")
+    parser.add_argument("--max-attenuation-db", type=float, default=0.0,
+                        help="no output bin cut by more than this (0 = no limit; yaml 12)")
     parser.add_argument("--out", type=Path, default=None, help="directory for the input/enhanced WAVs")
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
@@ -161,11 +171,23 @@ def main(argv: list[str] | None = None) -> int:
     gains = [float(g) for g in args.gains.split()]
     left_ms, hop_ms, right_ms = (int(v) for v in args.window.split("/"))
     model = AudxModel(
-        args.checkpoint, args.device, agc_target_dbfs=args.agc_target_dbfs, agc_max_gain_db=args.agc_max_gain_db
+        args.checkpoint,
+        args.device,
+        agc_target_dbfs=args.agc_target_dbfs,
+        agc_max_gain_db=args.agc_max_gain_db,
+        agc_ceiling_dbfs=args.agc_ceiling_dbfs,
+        clamp_to_input=args.clamp_to_input,
+        max_attenuation_db=args.max_attenuation_db,
     )
-    agc = f"AGC {args.agc_target_dbfs:g} dBFS +{args.agc_max_gain_db:g} dB" if args.agc_max_gain_db > 0 else "no AGC"
+    agc = "no AGC"
+    if args.agc_max_gain_db > 0:
+        ceiling = f" ceiling {args.agc_ceiling_dbfs:g} dBFS" if args.agc_ceiling_dbfs != 0 else ""
+        agc = f"AGC {args.agc_target_dbfs:g} dBFS +{args.agc_max_gain_db:g} dB{ceiling}"
+    clamp = ["to input"] if args.clamp_to_input else []
+    if args.max_attenuation_db > 0:
+        clamp.append(f"max attenuation {args.max_attenuation_db:g} dB")
     print(f"checkpoint {args.checkpoint} sha256 {model.sha256} device {args.device}"
-          f"{' narrowband (G.711 path)' if args.narrowband else ''}")
+          f"{' narrowband (G.711 path)' if args.narrowband else ''}; clamp {', '.join(clamp) or 'off'}")
     if args.out:
         args.out.mkdir(parents=True, exist_ok=True)
 
