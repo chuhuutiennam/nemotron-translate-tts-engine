@@ -91,7 +91,7 @@ vad:
   energy_db_threshold: -42.0             # VAD_ENERGY_DB_THRESHOLD
   min_speech_ms: 250                     # VAD_MIN_SPEECH_MS
   end_silence_ms: 250                    # VAD_END_SILENCE_MS  (giảm từ 400 để cắt utterance sớm hơn; đếm theo cửa sổ Silero 32 ms: 300 = 320 ms, 250 = 256 ms, 200 = 224 ms; END vẫn quyết định khi chunk đến)
-  pre_roll_ms: 150                       # VAD_PRE_ROLL_MS
+  pre_roll_ms: 250                       # VAD_PRE_ROLL_MS  (audio trước START đưa vào utterance; bộ đệm = pre_roll_ms + min_speech_ms = 500 ms; cuộc gọi thật 2026-11-03: 150 cắt âm đầu 11/15 lượt nói, 250 còn 8/15; trùng server từ 2026-11-04)
   no_start_warn_ms: 5000                 # VAD_NO_START_WARN_MS  (cảnh báo khi stream nhận ngần này audio mà VAD chưa START lần nào; 0 = tắt)
   device: cpu                            # VAD_DEVICE
   max_utterance_ms: 10000                # MAX_UTTERANCE_MS  (giảm từ 20000 để chặn trần độ trễ audio dịch)

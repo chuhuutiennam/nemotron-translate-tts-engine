@@ -83,7 +83,7 @@ data:
   # SILERO_MODEL_PATH unset → load_silero_vad() from pip silero-vad package
   VAD_MIN_SPEECH_MS: "250"
   VAD_END_SILENCE_MS: "600"
-  VAD_PRE_ROLL_MS: "100"
+  VAD_PRE_ROLL_MS: "250"  # bộ đệm = pre_roll + min_speech = 500 ms; như yaml
   VAD_NO_START_WARN_MS: "5000"       # cảnh báo khi stream nhận ngần này audio mà VAD chưa START; 0 = tắt
   MAX_UTTERANCE_MS: "20000"
 
