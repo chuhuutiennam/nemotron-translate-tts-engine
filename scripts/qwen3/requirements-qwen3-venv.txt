@@ -1,0 +1,14 @@
+# Venv RIÊNG cho Qwen3-ASR (docs/qwen3-asr-design.md mục 4). KHÔNG cài vào /opt/nemotron-venv:
+# qwen-asr 0.0.6 khoá vllm==0.14.0, vllm kéo torch 2.9.1 (wheel PyPI = CUDA 12.8), còn engine dùng torch 2.12.1+cu124.
+# Cần: Linux x86_64, Python 3.12, driver NVIDIA >= 570, gcc + python3.12-dev (Triton JIT của vLLM).
+#
+# 1) Máy có Internet (Linux x86_64, Python 3.12, vd WSL Ubuntu / Kaggle): gom đủ wheel, kể cả gói chỉ có sdist
+#      python3.12 -m venv /tmp/qwen-dl && /tmp/qwen-dl/bin/pip install -U pip wheel
+#      /tmp/qwen-dl/bin/pip wheel -r scripts/qwen3/requirements-qwen3-venv.txt -w wheels_qwen3
+# 2) Server (offline):
+#      python3.12 -m venv /opt/qwen-asr-venv
+#      /opt/qwen-asr-venv/bin/pip install --no-index --find-links wheels_qwen3 -r scripts/qwen3/requirements-qwen3-venv.txt
+#      /opt/qwen-asr-venv/bin/python scripts/probe_qwen3_asr.py env --model-path $APP_DIR/models/Qwen3-ASR-1.7B
+
+qwen-asr[vllm]==0.0.6   # -> vllm==0.14.0, torch==2.9.1, transformers==4.57.6, accelerate==1.12.0
+soxr                    # probe --narrowband (đường G.711 như rtpgw) và đọc WAV khác 16 kHz

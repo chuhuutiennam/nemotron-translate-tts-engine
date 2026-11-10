@@ -25,6 +25,7 @@ log trace nằm ở [pipeline-trace-guide.md](pipeline-trace-guide.md); cách bu
 | Probe | `probe_tts.py` | Tổng hợp thử một câu bằng Piper, ghi G.711 thô | Máy có model | `PYTHONPATH=src`, onnxruntime |
 | Probe | `probe_audx.py` | Chạy checkpoint AudX (model `audx`, không phải resemble-enhance) trên WAV offline: mức tiếng nói / khoảng lặng / dải tần, phụ thuộc mức âm lượng, cửa sổ vs cả file, đường stream có AGC như `model: audx` (mục 4.6) | Máy có torch (WSL) | `PYTHONPATH=src`, torch, soxr, prometheus_client, pyyaml |
 | Probe | `probe_preproc_gpu.py` | Nạp `denoiser.onnx` bằng loader của engine trên GPU, đo CUDA EP, thời gian cửa sổ, thông lượng, VRAM | GPU server (venv engine) | `PYTHONPATH=src`, onnxruntime-gpu, scipy, torch, `models/resemble-enhance/denoiser.onnx` |
+| Probe | `probe_qwen3_asr.py` | Gate 0 của Qwen3-ASR-1.7B (nhánh `exp/qwen3-asr`): driver / gói / model (`env`), thời gian mỗi lần gọi streaming, VRAM, số stream (`latency`), WER stream / offline ra JSONL cho `eval_wer.py score` (`wer`) (mục 4.7) | GPU server, **venv Qwen riêng** `/opt/qwen-asr-venv` | `scripts/qwen3/requirements-qwen3-venv.txt`, model `models/Qwen3-ASR-1.7B`, driver ≥ 570 |
 | Vận hành | `run-gpu-server.sh` | Khởi động engine trên GPU server (đặt `LD_LIBRARY_PATH`, đường dẫn model) | GPU server | `setup-gpu-server.sh` đã chạy |
 | Vận hành | `run_server.sh` | Khởi động engine ở môi trường dev | Máy dev | python có đủ dependency |
 | Vận hành | `canary_preproc.sh` | Canary `audio_preprocessing` trên GPU server (resemble-enhance denoiser với `MODEL=resemble`, mặc định, hoặc AudX với `MODEL=audx`): kiểm tra điều kiện, bật/tắt trong YAML, đọc log khởi động, metric, replay (mục 5.1) | GPU server, cùng máy với service | bash, curl, systemctl (sudo), python của venv, nvidia-smi |
@@ -670,6 +671,53 @@ WSL CPU, đường G.711):
   - RTF 0.036–0.047.
   - Mức tiếng nói giữ trong khoảng −0.5…+2.0 dB khi đầu vào từ 0 đến −30 dB.
   - SI-SDR ngang gain tĩnh lý tưởng (+9.6…+10.4 ở nhiễu 5 dB).
+
+### 4.7 `probe_qwen3_asr.py` — Gate 0 của Qwen3-ASR-1.7B
+
+Đo Qwen/Qwen3-ASR-1.7B trước khi tích hợp vào engine. Thiết kế, cài venv, tiêu chí: [qwen3-asr-design.md](qwen3-asr-design.md).
+Chạy bằng **python của venv Qwen riêng** (`/opt/qwen-asr-venv`: qwen-asr 0.0.6, vLLM 0.14.0, torch 2.9.1 cu128), không phải
+venv engine. Cài venv theo `scripts/qwen3/requirements-qwen3-venv.txt`. Script tự thêm `src/` và `scripts/kaggle/` vào
+`sys.path` (dùng lại `client_audio.read_wav` / `to_narrowband` và `eval_wer.load_manifest` / định dạng JSONL), không
+cần `PYTHONPATH`. Dùng đúng API streaming public của `qwen_asr` như file ví dụ của Qwen.
+
+```bash
+M=$APP_DIR/models/Qwen3-ASR-1.7B; PY=/opt/qwen-asr-venv/bin/python
+$PY scripts/probe_qwen3_asr.py env --model-path $M
+$PY scripts/probe_qwen3_asr.py latency --model-path $M --wav asr_data/banking_trouble.wav --json-out out/qwen_latency.json
+$PY scripts/probe_qwen3_asr.py wer --model-path $M --manifest testdata/vi.tsv --out out/qwen_stream.jsonl
+$PY scripts/probe_qwen3_asr.py wer --model-path $M --manifest testdata/vi.tsv --mode offline --out out/qwen_offline.jsonl
+/opt/nemotron-venv/bin/python scripts/kaggle/eval_wer.py score --base out/nemotron.jsonl out/qwen_stream.jsonl out/qwen_offline.jsonl
+```
+
+| Lệnh | Làm gì | Mã thoát |
+|------|--------|----------|
+| `env` | `nvidia-smi` (driver phải ≥ 570 cho torch cu128), phiên bản qwen-asr / vllm / torch / transformers so với bản khoá, `torch.cuda`, `gcc` + `Python.h` (Triton JIT), thư mục model (`config.json`, `tokenizer_config.json`, `*.safetensors`) | 0 OK, 2 thiếu điều kiện |
+| `latency` | Nạp model (thời gian, VRAM toàn GPU), audio `--wav` (nối và lặp đến độ dài utterance) chạy streaming theo từng chunk: thời gian mỗi lần gọi theo lượng audio đã tích luỹ, finish, GPU-giây mỗi giây tiếng nói, số stream phục vụ tuần tự, so với ngân sách `chunk × headroom / --target-streams` | 0 |
+| `wer` | Mỗi dòng manifest: `stream` (từng chunk như engine gửi STEP, cắt cứng `--max-utterance-s` 10) hoặc `offline` (`transcribe()` cả clip) → JSONL định dạng `eval_wer.py run` | 0, 1 nếu có clip lỗi |
+
+| Tham số | Mặc định | Ý nghĩa |
+|---------|----------|---------|
+| `--model-path` | `models/Qwen3-ASR-1.7B` | Bản tải HF của model |
+| `--device` | `cuda:0` | Đặt `CUDA_VISIBLE_DEVICES` (vLLM dùng GPU nhìn thấy đầu tiên) |
+| `--offline` | bật | `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` |
+| `--gpu-memory-utilization` | `0.4` | Phần bộ nhớ toàn GPU vLLM được dùng; GPU phải còn trống ngần ấy lúc khởi động |
+| `--max-model-len` / `--max-num-seqs` | `2048` / `1` | Context và số request đồng thời của vLLM |
+| `--max-new-tokens` | `64` | Token mỗi lần gọi (ví dụ của Qwen dùng 32, có thể cắt cụt 2 chunk đầu tiếng Việt) |
+| `--chunk-size-sec` | `2.0` | `chunk_size_sec` của streaming (`latency` dùng `--chunk-sizes`, mặc định `1.0 2.0`) |
+| `--unfixed-chunk-num` / `--unfixed-token-num` | `2` / `5` | Như ví dụ của Qwen |
+| `--language` | `vi` | `vi` / `en` (ép ngôn ngữ), `auto` (model tự nhận), tên qwen_asr; `wer` nhận thêm `@lang` (cột manifest) |
+| `--context` | rỗng | Text đưa vào system prompt (từ khoá) |
+| `--narrowband` | bật | Đường G.711 như rtpgw (cần soxr) |
+| `--attention-backend`, `--enforce-eager`, `--dtype`, `--quantization` | rỗng / tắt | Truyền thẳng cho vLLM (`TRITON_ATTN` cho T4, `fp8` thử trên L4) |
+| `latency --utterance-s` / `--reps` | `9.5` / `5` | Độ dài utterance (9.5 < 10 s và làm finish chạy) / số lần lặp (+1 warm-up) |
+| `latency --target-streams` / `--headroom` | `8` / `0.7` | Ngân sách gọi = chunk × headroom / số stream (chunk 2 s → 175 ms) |
+| `wer --mode` / `--max-utterance-s` | `stream` / `10` | |
+| `wer --limit` / `--warmup` | `0` (tất cả) / `1` | |
+
+JSONL của `wer` có thêm `mode`, `language_detected`, và ở `stream`: `utterances`, `calls`, `call_ms_p50`, `call_ms_max`,
+`finish_ms_max`. `total_s` là thời gian xử lý (không phát theo thời gian thực), `first_result_s` không đo. Khi so với
+baseline Nemotron chạy qua engine: engine trên server đang bật AudX và cắt utterance bằng VAD, còn probe đưa audio
+thẳng vào model và cắt cứng 10 s (design mục 5.1).
 
 ---
 

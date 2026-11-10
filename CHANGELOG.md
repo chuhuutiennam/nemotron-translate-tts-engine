@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Branch `exp/qwen3-asr` (from `nemotron` 0df0f6d). `scripts/probe_qwen3_asr.py` (new), `scripts/qwen3/requirements-qwen3-venv.txt` (new), `tests/test_probe_qwen3_asr.py` (new), `docs/qwen3-asr-design.md` (new), `docs/scripts-guide.md` (0, 4.7 new): Gate 0 for Qwen/Qwen3-ASR-1.7B as an ASR backend.
+  - **Why:** user request: try Qwen3-ASR-1.7B instead of Nemotron, as in QwenLM's `example_qwen3_asr_vllm_streaming.py`.
+  - **Agreed with the user:**
+    - Qwen runs in a child process from a separate venv (`/opt/qwen-asr-venv`). `qwen-asr` 0.0.6 pins `vllm==0.14.0`, which pulls torch 2.9.1 (CUDA 12.8, driver >= 570); the engine venv stays on torch 2.12.1+cu124.
+    - Measure first, no engine change yet.
+    - At most 8 streams per L4, served one call at a time.
+  - **Facts from the qwen_asr source** (`docs/qwen3-asr-design.md` section 3): streaming is vLLM-only and has no batch or timestamps. Every chunk (default 2 s) encodes the whole utterance so far again, with the decoded text minus the last 5 tokens as prefix. The cost of a call therefore grows with the utterance length.
+  - **`probe_qwen3_asr.py`** runs with the Qwen venv python. It uses the public streaming API, as the example does, and reuses `client_audio` (WAV, G.711 path) and `eval_wer` (manifest, JSONL format, WER).
+    - `env`: driver >= 570, package versions against the pins, `torch.cuda`, gcc / `Python.h` for the Triton JIT, model folder.
+    - `latency`: load time, whole-GPU VRAM, time of each streaming call by audio so far, finish time, GPU seconds per speech second, streams served one call at a time, and the check against `chunk x headroom / target streams` (175 ms for 2 s and 8 streams).
+    - `wer`: a manifest, either chunk by chunk like engine STEPs with a hard 10 s cut, or offline on the whole clip, written as JSONL in the `eval_wer.py run` format.
+    - `max_new_tokens` defaults to 64 rather than the example's 32, which may cut the first 2 chunks of Vietnamese.
+    - The probe sets `CUDA_VISIBLE_DEVICES`, `VLLM_WORKER_MULTIPROC_METHOD=spawn` and `HF_HUB_OFFLINE` before vLLM starts.
+  - **Verified:**
+    - pytest on Windows: 988 passed, 27 skipped. The 26 new tests use a fake model with qwen_asr's state fields.
+    - The CLI runs on the dev machine: `env` exits 2 without `nvidia-smi`.
+    - The real G.711 path on `asr_data/friend.wav` gives 49.42 s in and out.
+  - **Not yet done:**
+    - Gate 0 on the GPU server: no GPU on the dev machine; the driver version is unknown.
+    - Phase 1, the engine integration behind `asr.backend: nemotron | qwen3` (design section 6), waits for the Gate 0 numbers and the user's go.
+
 - `src/nemotron_testbed/{audx_model,audio_preprocess_runtime,config}.py`, `etc/nemotron-engine.yaml`, the three ConfigMaps, `scripts/{probe_audx.py,canary_preproc.sh}`, `tests/{test_audx_model,test_config_yaml}.py`, `README.md`, `docs/{audx-stateful-design (status, decisions 8/9/15, 4, 8, 9 new),scripts-guide (4.6, 5.1),server-setup-guide (B, model audx),system-design}.md`: AudX AGC ceiling and clamp of the model output.
   - **Why:** the first real `trace_pcap` from the server (2026-11-03, a clean call, 52% digital zero) showed two faults of mode `audx`:
     - the first word of the call was cut 13–18 dB: a −61 dBFS click set the AGC level, the gain rose to +23 dB and the model got +14 dBFS peaks;
