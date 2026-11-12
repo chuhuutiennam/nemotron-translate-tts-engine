@@ -38,7 +38,9 @@ class NemotronRuntimePool:
     A START command assigns one logical stream/utterance to exactly one runtime.
     Every STEP/FINALIZE/CANCEL for that stream is routed to the same owner until
     FINAL or CANCELLED is emitted. Each worker owns its own model replica and
-    all encoder/RNNT caches for the streams assigned to it.
+    all encoder/RNNT caches for the streams assigned to it. A worker emits
+    CANCELLED only after it has dropped the utterance's queued commands and
+    freed its state, so the affinity is released last.
     """
 
     def __init__(
@@ -93,6 +95,25 @@ class NemotronRuntimePool:
     def active_owners(self) -> int:
         with self._lock:
             return len(self._owners)
+
+    @property
+    def pending_cancellations(self) -> int:
+        """CANCELs recorded by the workers and not yet cleaned up."""
+        return sum(runtime.pending_cancellations for runtime in self._runtimes)
+
+    def _cancel_without_owner(self, command: RuntimeCommand) -> bool:
+        """A CANCEL with no owner (no START was assigned, or FINAL/CANCELLED already released it) has nothing to
+        clean up: confirm it here. False for any other command."""
+        if command.type is not RuntimeCommandType.CANCEL or command.key is None:
+            return False
+        self._result_callback(
+            RuntimeResult(
+                type=RuntimeResultType.CANCELLED,
+                key=command.key,
+                utterance_id=command.utterance_id,
+            )
+        )
+        return True
 
     def start(self, timeout: float = 300.0) -> None:
         started: list[NemotronRuntime] = []
@@ -166,15 +187,7 @@ class NemotronRuntimePool:
             )
 
         if owner is None:
-            if command.type is RuntimeCommandType.CANCEL and command.key is not None:
-                # No START was ever assigned, or FINAL already released affinity.
-                self._result_callback(
-                    RuntimeResult(
-                        type=RuntimeResultType.CANCELLED,
-                        key=command.key,
-                        utterance_id=command.utterance_id,
-                    )
-                )
+            if self._cancel_without_owner(command):
                 return
             raise RuntimeError(
                 f"No ASR runtime owner for command={command.type.name} key={command.key}"
@@ -209,14 +222,7 @@ class NemotronRuntimePool:
             )
 
         if owner is None:
-            if command.type is RuntimeCommandType.CANCEL and command.key is not None:
-                self._result_callback(
-                    RuntimeResult(
-                        type=RuntimeResultType.CANCELLED,
-                        key=command.key,
-                        utterance_id=command.utterance_id,
-                    )
-                )
+            if self._cancel_without_owner(command):
                 return SubmitStatus.ACCEPTED
             return SubmitStatus.UNAVAILABLE
 
@@ -235,6 +241,8 @@ class NemotronRuntimePool:
             raise RuntimeError("SHUTDOWN is managed by NemotronRuntimePool.shutdown()")
         owner = self._owner_for(command)
         if owner is None:
+            if self._cancel_without_owner(command):
+                return
             raise RuntimeError(
                 f"No ASR runtime owner for command={command.type.name} key={command.key}"
             )

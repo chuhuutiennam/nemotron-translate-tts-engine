@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/{runtime,pools}.py`, `tests/test_runtime_cancel.py` (new, 7 tests), `docs/system-design.md` (5.4, 5.5, 7.2, 7.3): fix ASR state leaks on CANCEL.
+  - **Bugs fixed:**
+    - CANCEL before START: when an RPC was cancelled while its START still waited in the worker queue, CANCEL (priority 0) ran first and found no state. The START (priority 2) then created encoder caches that nobody freed, because the RPC and the pool affinity were already gone (RPC=0, owner=0, state=1). The key holds `rpc_id`, so the state stayed until restart.
+    - CANCEL with a full queue: `fail_rpc` -> `cancel_rpc` (e.g. "ASR queue full at utterance finalize") called `submit_nowait(CANCEL)` on the full queue. It raised `QueueFullError` ("Failed to cancel runtime utterance"), so state and affinity were never freed.
+  - **Change (`runtime.py`):** `_CommandQueue` replaces the `PriorityQueue`: a bounded command heap (`SHUTDOWN` > `FINALIZE` > `START` > `STEP`) and a separate CANCEL path under one lock.
+    - CANCEL marks `(StreamKey, utterance_id)` on the caller's thread and wakes the worker. It never waits for room, and a repeated CANCEL counts once.
+    - The worker takes cancel requests before any command. It drops the utterance's queued commands, frees its state, releases the mark and only then emits `CANCELLED`. Commands for a marked utterance are dropped at submit (still `ACCEPTED`) and before they run.
+    - `pending_cancellations`: CANCELs recorded and not yet cleaned up.
+    - Only the worker thread changes model state.
+  - **Change (`pools.py`):** `pending_cancellations` (sum over the workers). `_cancel_without_owner` replaces three copies of "CANCEL with no owner -> CANCELLED"; the blocking `submit()` now handles that case too, as `submit_nowait` did. Affinity is still released on `CANCELLED`, which now comes after the cleanup.
+  - **Behaviour to know:**
+    - A command already running when CANCEL arrives finishes and emits its result before `CANCELLED`; the coordinator drops it (stream gone).
+    - `asr_queue_wait_ms` no longer gets CANCEL samples; `MODEL_STEP_SECONDS{command="CANCEL"}` now times the cleanup.
+    - No on/off switch: this is a bug fix.
+  - **Verified:**
+    - Real pool and worker threads, model replaced. The repro of the first bug went from `CANCELLED, STARTED` with state 1 to `CANCELLED` with state 0.
+    - `tests/test_runtime_cancel.py` covers: CANCEL before START, during STEP, after FINAL (also when it reaches the worker before the affinity is released), repeated, with a full queue, waking an idle worker, and 300 random open/cancel cycles on 2 workers. Each test checks that state, affinity, cancellation marks and queue depth return to 0.
+    - pytest (Windows) 969 passed, 27 skipped; the new file passed 5 runs in a row.
+  - **Not yet done:** a run on the GPU server with the real model.
+
 - Branch `exp/qwen3-asr` (from `nemotron` 0df0f6d). `scripts/probe_qwen3_asr.py` (new), `scripts/qwen3/requirements-qwen3-venv.txt` (new), `tests/test_probe_qwen3_asr.py` (new), `docs/qwen3-asr-design.md` (new), `docs/scripts-guide.md` (0, 4.7 new): Gate 0 for Qwen/Qwen3-ASR-1.7B as an ASR backend.
   - **Why:** user request: try Qwen3-ASR-1.7B instead of Nemotron, as in QwenLM's `example_qwen3_asr_vllm_streaming.py`.
   - **Agreed with the user:**

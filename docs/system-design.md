@@ -200,17 +200,23 @@ Cả bốn pool dùng chung khuôn: tạo N runtime với `device = devices[i % 
 - **`NemotronRuntimePool`** (có trạng thái):
   - Affinity theo `(StreamKey, utterance_id)`; hai utterance cùng stream có thể rơi vào hai worker.
   - Chọn worker chỉ ở lệnh `START`, theo độ sâu hàng đợi, số utterance đang sở hữu và vòng tròn; các lệnh sau đi theo owner đã gán.
-  - Giải phóng affinity khi nhận `FINAL` hoặc `CANCELLED`, hoặc khi `START` bị từ chối.
-  - `CANCEL` không có owner được pool tự phát `CANCELLED`.
+  - Giải phóng affinity khi nhận `FINAL` hoặc `CANCELLED`, hoặc khi `START` bị từ chối. Worker chỉ phát `CANCELLED` sau khi đã dọn xong utterance (mục 5.5), nên affinity là thứ được giải phóng sau cùng.
+  - `CANCEL` không có owner (chưa từng có `START`, hoặc `FINAL`/`CANCELLED` đã giải phóng) được pool tự phát `CANCELLED`.
+  - `pending_cancellations`: tổng số `CANCEL` các worker đã ghi nhận mà chưa dọn xong.
 - **`TranslationRuntimePool`, `TtsRuntimePool`, `MagpieTtsRuntimePool`** (không trạng thái): thử các worker theo thứ tự độ sâu hàng đợi; tất cả đầy thì `QueueFullError` hoặc trạng thái `OVERLOADED`.
 - `MagpieTtsRuntimePool` cùng interface với `TtsRuntimePool`; coordinator chọn theo `tts.backend`.
 
 ### 5.5 `runtime.py` — `NemotronRuntime` (ASR)
 
-- Một thread mỗi worker, hàng đợi ưu tiên: `SHUTDOWN` > `CANCEL` > `FINALIZE` > `START` > `STEP`.
+- Một thread mỗi worker, hàng đợi lệnh có giới hạn (`queue_size`) và ưu tiên: `SHUTDOWN` > `FINALIZE` > `START` > `STEP`.
+- `CANCEL` không vào hàng đợi lệnh mà đi đường riêng (`_CommandQueue`), không bao giờ bị từ chối vì hàng đợi đầy:
+  - Ghi nhận ngay trên thread gửi: đánh dấu `(StreamKey, utterance_id)` đã hủy rồi đánh thức worker. `CANCEL` lặp lại cho utterance đang có dấu chỉ được tính một lần.
+  - Worker xử lý yêu cầu hủy trước mọi lệnh: bỏ các lệnh còn chờ của utterance, xóa state, xóa dấu, cuối cùng mới phát `CANCELLED`.
+  - Khi utterance đang có dấu, lệnh mới gửi cho nó bị bỏ (vẫn trả `ACCEPTED`), và lệnh đã ra khỏi hàng đợi bị bỏ trước khi chạy. Lệnh đang chạy dở thì chạy xong và phát kết quả trước `CANCELLED`; coordinator bỏ kết quả đó vì stream đã mất.
+  - Nhờ vậy `START` còn chờ của utterance đã hủy không tạo lại state. Trước bản sửa, `CANCEL` (ưu tiên cao hơn) chạy trước `START`, rồi `START` tạo cache mà không còn ai giải phóng. Còn khi hàng đợi đầy, `CANCEL` bị `QueueFullError`.
 - Nạp model `EncDecRNNTBPEModelWithPrompt.restore_from(...)`, đặt `att_context_size=[left_context, lookahead_tokens]`, dựng preprocessor riêng (`dither=0`, `pad_to=0`), warmup tối đa 128 bước.
 - Giải mã greedy khi `beam_size == 1`, beam search khi lớn hơn; bật confidence theo token (`max_prob`).
-- Mỗi utterance có state riêng (cache encoder, `previous_hypotheses`, feature cache); tạo khi `START`, xóa khi `FINALIZE`/`CANCEL`.
+- Mỗi utterance có state riêng (cache encoder, `previous_hypotheses`, feature cache); tạo khi `START`, xóa khi `FINALIZE` hoặc khi worker xử lý yêu cầu hủy. Chỉ thread worker sửa state.
 - `STEP` trích feature, chạy `conformer_stream_step`, bóc tag ngôn ngữ `<xx-XX>` khỏi text, tính confidence (ưu tiên token confidence, sau đó word/frame, cuối cùng là `exp(score/token_count)`).
 - `FINALIZE` lặp bước với `flush=True` (tối đa 1024 lần) rồi phát `FINAL`.
 - Lỗi khi chạy lệnh phát `ERROR` nhưng thread vẫn sống; lỗi khi nạp model làm `start()` raise `RuntimeError`.
@@ -402,11 +408,11 @@ sequenceDiagram
 | `max_concurrent_utterances` | Bộ đếm tính toàn engine, gồm cả utterance đang finalize (chỉ giảm khi ASR FINAL hoặc hủy). Vượt thì `fail_rpc(RESOURCE_EXHAUSTED)` khi VAD `START` cần mở utterance mới, tức hỏng cả RPC; 0 là không giới hạn |
 | `max_postprocess_pending_per_rpc` | Đếm theo segment; vượt thì `fail_rpc(RESOURCE_EXHAUSTED)` |
 | `AsyncResponseBuffer` | Quá `soft_limit` thì loại partial không có audio (ưu tiên cùng stream, sau đó cũ nhất); final và partial có audio không bao giờ bị loại |
-| Hàng đợi ASR đầy | Lệnh `STEP` bị `OVERLOADED`: audio trả về đầu buffer và thử lại ở chunk sau; `UNAVAILABLE` (runtime đã dừng) thì trả audio rồi `fail_rpc(RESOURCE_EXHAUSTED)`. Lệnh `START` hoặc `FINALIZE` không được nhận thì `fail_rpc(RESOURCE_EXHAUSTED)`; ở `FINALIZE`, phần audio còn lại đã rút khỏi buffer nên mất |
+| Hàng đợi ASR đầy | Lệnh `STEP` bị `OVERLOADED`: audio trả về đầu buffer và thử lại ở chunk sau; `UNAVAILABLE` (runtime đã dừng) thì trả audio rồi `fail_rpc(RESOURCE_EXHAUSTED)`. Lệnh `START` hoặc `FINALIZE` không được nhận thì `fail_rpc(RESOURCE_EXHAUSTED)`; ở `FINALIZE`, phần audio còn lại đã rút khỏi buffer nên mất. `CANCEL` sau đó vẫn được nhận vì đi đường riêng (mục 5.5) |
 
 ### 7.3 Hủy, lỗi và tắt máy
 
-- `cancel_rpc` gửi `CANCEL` cho các utterance đang chạy, xóa job và order của RPC, đóng buffer.
+- `cancel_rpc` gửi `CANCEL` cho các utterance đang chạy, xóa job và order của RPC, đóng buffer. Worker ASR dọn state của utterance kể cả khi `START` của nó còn chờ hoặc hàng đợi đầy (mục 5.5).
 - `fail_rpc` đặt `RpcFailure` vào buffer rồi hủy RPC.
 - Nếu `rpc_max_idle_s` giây không có phần tử nào ra `response_buffer` (đo phía output, không phải input), `service.py` hủy RPC rồi abort `CANCELLED`; 0 là tắt. Cơ chế này nằm ở service, không nằm ở coordinator.
 - Kết quả cũ (stream, utterance hoặc job đã mất) bị bỏ và đếm bằng `STALE_RESULTS`.
