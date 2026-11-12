@@ -913,6 +913,159 @@ class RejectOnceTtsRuntime(FakeTtsRuntime):
         return SubmitStatus.ACCEPTED
 
 
+class PipelineOrderFromStartTest(unittest.IsolatedAsyncioTestCase):
+    """The translate pipeline order exists from the start of an utterance, so an utterance that never reaches
+    translation (empty ASR, passthrough) is recorded in it even when it is the first to reach FINAL.
+
+    Before the fix the order was only created by the first translation job: an empty or passthrough FINAL that
+    came first was lost (empty) or emitted at once (passthrough, out of order), and the order created later
+    waited on its slot forever, so the next utterance never reached TTS and the RPC never finished.
+    """
+
+    async def _three_utterances(self, target, segmentation="off"):
+        coordinator = EngineCoordinator(make_settings(True, max_utterance_ms=40, segmentation_mode=segmentation))
+        asr, tr, tts = FakeRuntime(), FakeTranslationRuntime(), FakeTtsRuntime()
+        coordinator.runtime, coordinator.translation_runtime, coordinator.tts_runtime = asr, tr, tts
+        rpc = coordinator.open_rpc()
+
+        def chunk(ts, end=False):
+            return request(ts, end=end, task="translate", language=target)
+
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(0))
+        key = asr.commands[-1].key
+        for uid, ts in ((1, 0), (2, 320), (3, 640)):
+            if uid > 1:
+                await coordinator.accept_chunk(rpc.rpc_id, chunk(ts))
+            await coordinator._handle_runtime_result(
+                RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=uid)
+            )
+            await coordinator.accept_chunk(rpc.rpc_id, chunk(ts + 160, end=(uid == 3)))
+            self.assertEqual((asr.commands[-1].type.name, asr.commands[-1].utterance_id), ("FINALIZE", uid))
+        return coordinator, rpc, key, tr, tts
+
+    @staticmethod
+    async def _final(coordinator, key, uid, text, language):
+        await coordinator._handle_runtime_result(
+            RuntimeResult(type=RuntimeResultType.FINAL, key=key, utterance_id=uid, text=text, detected_language=language)
+        )
+
+    @staticmethod
+    async def _translated(coordinator, key, uid, src, dst, src_lang, dst_lang):
+        await coordinator._handle_translation_result(
+            TranslationResult(
+                key=key, utterance_id=uid, source_text=src, translated_text=dst,
+                source_language=src_lang, target_language=dst_lang, ts_start=0, ts_end=1,
+            )
+        )
+
+    @staticmethod
+    async def _spoken(coordinator, key, uid, text, language):
+        await coordinator._handle_tts_result(
+            TtsResult(
+                key=key, utterance_id=uid, text=text, target_language=language,
+                ts_start=0, ts_end=1, audio_payload=b"\xff" * 80, audio_pt=0,
+            )
+        )
+
+    @staticmethod
+    def _emitted(rpc):
+        return [
+            (e.utterance_id, e.text, bool(e.audio_payload))
+            for e in rpc.response_buffer._items
+            if isinstance(e, RecognitionEnvelope)
+        ]
+
+    async def test_empty_utterance_finishing_first_does_not_block_the_next_ones(self):
+        """Reported: FINAL 2 (empty) -> 1 -> 3; utterance 3 was translated but never sent to TTS."""
+        for segmentation in ("off", "on"):
+            with self.subTest(segmentation=segmentation):
+                coordinator, rpc, key, tr, tts = await self._three_utterances("en", segmentation)
+                await self._final(coordinator, key, 2, "", "vi-VN")
+                await self._final(coordinator, key, 1, "Xin chao", "vi-VN")
+                await self._final(coordinator, key, 3, "Tam biet", "vi-VN")
+                self.assertEqual([job.utterance_id for job in tr.jobs], [1, 3])
+                await self._translated(coordinator, key, 1, "Xin chao", "Hello", "vi-VN", "en-US")
+                await self._translated(coordinator, key, 3, "Tam biet", "Goodbye", "vi-VN", "en-US")
+                self.assertEqual([job.text for job in tts.jobs], ["Hello"])  # 3 waits for 1, as it should
+                await self._spoken(coordinator, key, 1, "Hello", "en-US")
+                self.assertEqual([job.text for job in tts.jobs], ["Hello", "Goodbye"])  # 2 recorded as done
+                await self._spoken(coordinator, key, 3, "Goodbye", "en-US")
+                await coordinator.close_input(rpc.rpc_id)
+
+                self.assertEqual(self._emitted(rpc), [(1, "Hello", True), (3, "Goodbye", True)])
+                self.assertEqual(rpc.pending_postprocess, 0)
+                self.assertTrue(rpc.finished)
+                self.assertNotIn(key, coordinator._pipeline_order)
+
+    async def test_passthrough_utterance_finishing_first_keeps_the_order(self):
+        """Reported: utterance 2 in the target language (original audio) reached FINAL first and was played
+        before utterance 1, then utterance 3 was stuck as above."""
+        for segmentation in ("off", "on"):
+            with self.subTest(segmentation=segmentation):
+                coordinator, rpc, key, tr, tts = await self._three_utterances("vi", segmentation)
+                await self._final(coordinator, key, 2, "xin chao", "vi-VN")  # source == target: passthrough
+                self.assertEqual(self._emitted(rpc), [])  # held behind utterance 1
+                await self._final(coordinator, key, 1, "Hello", "en-US")
+                await self._final(coordinator, key, 3, "Goodbye", "en-US")
+                await self._translated(coordinator, key, 1, "Hello", "Xin chao", "en-US", "vi-VN")
+                await self._translated(coordinator, key, 3, "Goodbye", "Tam biet", "en-US", "vi-VN")
+                await self._spoken(coordinator, key, 1, "Xin chao", "vi-VN")
+                self.assertEqual([job.text for job in tts.jobs], ["Xin chao", "Tam biet"])
+                await self._spoken(coordinator, key, 3, "Tam biet", "vi-VN")
+                await coordinator.close_input(rpc.rpc_id)
+
+                self.assertEqual(
+                    self._emitted(rpc),
+                    [(1, "Xin chao", True), (2, "xin chao", True), (3, "Tam biet", True)],
+                )
+                self.assertEqual(rpc.pending_postprocess, 0)
+                self.assertTrue(rpc.finished)
+                self.assertNotIn(key, coordinator._pipeline_order)
+
+    async def _one_utterance(self, target):
+        coordinator = EngineCoordinator(make_settings(True, max_utterance_ms=40))
+        asr = FakeRuntime()
+        coordinator.runtime = asr
+        coordinator.translation_runtime, coordinator.tts_runtime = FakeTranslationRuntime(), FakeTtsRuntime()
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, request(0, task="translate", language=target))
+        key = asr.commands[-1].key
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=1))
+        await coordinator.accept_chunk(rpc.rpc_id, request(160, end=True, task="translate", language=target))
+        return coordinator, rpc, key
+
+    async def test_passthrough_with_nothing_before_it_is_emitted_at_once(self):
+        coordinator, rpc, key = await self._one_utterance("vi")
+        await self._final(coordinator, key, 1, "xin chao", "vi-VN")
+        self.assertEqual(self._emitted(rpc), [(1, "xin chao", True)])
+        await coordinator.close_input(rpc.rpc_id)
+        self.assertTrue(rpc.finished)
+        self.assertNotIn(key, coordinator._pipeline_order)
+
+    async def test_empty_utterance_with_nothing_before_it_finishes_the_rpc(self):
+        coordinator, rpc, key = await self._one_utterance("en")
+        await self._final(coordinator, key, 1, "", "vi-VN")
+        await coordinator.close_input(rpc.rpc_id)
+        self.assertEqual(self._emitted(rpc), [])
+        self.assertTrue(rpc.finished)
+        self.assertNotIn(key, coordinator._pipeline_order)
+
+    async def test_order_kept_while_an_utterance_is_in_flight_and_dropped_when_idle(self):
+        coordinator, rpc, key, tr, tts = await self._three_utterances("en")
+        await self._final(coordinator, key, 1, "Xin chao", "vi-VN")
+        await self._translated(coordinator, key, 1, "Xin chao", "Hello", "vi-VN", "en-US")
+        await self._spoken(coordinator, key, 1, "Hello", "en-US")
+        self.assertEqual(self._emitted(rpc), [(1, "Hello", True)])
+        self.assertIn(key, coordinator._pipeline_order)  # utterances 2 and 3 are still in ASR
+        self.assertEqual(coordinator._pipeline_order[key].next_emit_slot, (2, 0))
+
+        await self._final(coordinator, key, 2, "", "vi-VN")
+        await self._final(coordinator, key, 3, "", "vi-VN")
+        await coordinator.close_input(rpc.rpc_id)
+        self.assertTrue(rpc.finished)
+        self.assertNotIn(key, coordinator._pipeline_order)
+
+
 class _ExecutorVad:
     """Same interface as VadController; like Silero it runs in the executor (needs_executor), and it waits for
     `release` so a test can run fail_rpc / close_input / cancel_rpc while the coordinator awaits it."""
