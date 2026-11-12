@@ -21,6 +21,7 @@ from nemotron_testbed.domain import (
     RuntimeResult as _RuntimeResult,
     RuntimeResultType,
     StreamKey,
+    StreamPhase,
     TranslationResult,
     TtsResult,
 )
@@ -1001,6 +1002,118 @@ class TranscribeOrderTest(unittest.IsolatedAsyncioTestCase):
             [(1, True, "cau mot."), (2, True, self.SENT), (2, False, "and more"), (2, True, "and more words")],
         )
         self.assertEqual([e.seq for e in envs], [1, 2, 3, 4])
+
+    async def test_final_2_then_1_emits_1_then_2_with_segmentation_on_and_off(self):
+        for segmentation in (False, True):
+            with self.subTest(segmentation=segmentation):
+                coordinator, rpc, key = await self._two_utterances(segmentation=segmentation)
+                await self._final(coordinator, key, 2, "cau hai.")
+                self.assertEqual(self._envs(rpc), [])
+                await self._final(coordinator, key, 1, "cau mot.")
+                envs = self._envs(rpc)
+                self.assertEqual(
+                    [(e.utterance_id, e.is_final, e.text) for e in envs], [(1, True, "cau mot."), (2, True, "cau hai.")]
+                )
+                self.assertEqual([e.seq for e in envs], [1, 2])
+
+    async def test_empty_first_utterance_with_segmentation_on_and_off(self):
+        for segmentation in (False, True):
+            with self.subTest(segmentation=segmentation):
+                coordinator, rpc, key = await self._two_utterances(segmentation=segmentation)
+                await self._final(coordinator, key, 2, "cau hai.")
+                await self._final(coordinator, key, 1, "")
+                envs = self._envs(rpc)
+                self.assertEqual([(e.utterance_id, e.is_final, e.text) for e in envs], [(2, True, "cau hai.")])
+                self.assertEqual([e.seq for e in envs], [1])
+
+    async def test_end_of_stream_while_waiting_closes_only_after_the_held_results_are_out(self):
+        coordinator, rpc, key = await self._two_utterances()  # the last chunk carried end_of_stream
+        await coordinator.close_input(rpc.rpc_id)
+        await self._final(coordinator, key, 2, "cau hai")
+        stream = coordinator._streams.get(key)
+        self.assertIsNotNone(stream)  # utt1 still finishing: the stream stays open
+        self.assertIs(stream.phase, StreamPhase.CLOSING)
+        self.assertEqual(self._envs(rpc), [])
+        self.assertFalse(rpc.response_buffer._closed)
+        self.assertIn(rpc.rpc_id, coordinator._rpcs)
+
+        await self._final(coordinator, key, 1, "cau mot")
+        self.assertEqual([(e.utterance_id, e.text) for e in self._envs(rpc)], [(1, "cau mot"), (2, "cau hai")])
+        self.assertNotIn(key, coordinator._streams)  # closed after both were emitted
+        self.assertTrue(rpc.response_buffer._closed)
+        self.assertNotIn(rpc.rpc_id, coordinator._rpcs)
+
+    async def test_mo_and_mt_streams_are_ordered_independently(self):
+        coordinator = EngineCoordinator(make_settings(False, max_utterance_ms=40))
+        asr = FakeRuntime()
+        coordinator.runtime = asr
+        rpc = coordinator.open_rpc()
+
+        def chunk(ts, stream_id, end=False):
+            item = request(ts, end=end, language="en")
+            item.stream_id = stream_id
+            return item
+
+        async def started(key, utterance_id):
+            await coordinator._handle_runtime_result(
+                RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=utterance_id)
+            )
+
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(0, "MO"))
+        mo = asr.commands[-1].key
+        await started(mo, 1)
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(160, "MO"))  # MO utt1 -> FINALIZE
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(320, "MO"))
+        await started(mo, 2)
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(480, "MO", end=True))  # MO utt2 -> FINALIZE
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(0, "MT"))
+        mt = asr.commands[-1].key
+        self.assertEqual((mo.stream_id, mt.stream_id), ("MO", "MT"))
+        await started(mt, 1)
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(160, "MT", end=True))  # MT utt1 -> FINALIZE
+
+        await self._final(coordinator, mo, 2, "mo hai")  # held behind MO utt1
+        await self._final(coordinator, mt, 1, "mt mot")  # MT has nothing earlier: out at once
+        self.assertEqual([(e.stream_id, e.utterance_id, e.text) for e in self._envs(rpc)], [("MT", 1, "mt mot")])
+        await self._final(coordinator, mo, 1, "mo mot")
+
+        envs = self._envs(rpc)
+        self.assertEqual(
+            [(e.stream_id, e.utterance_id, e.text) for e in envs],
+            [("MT", 1, "mt mot"), ("MO", 1, "mo mot"), ("MO", 2, "mo hai")],
+        )
+        self.assertEqual([(e.stream_id, e.seq) for e in envs], [("MT", 1), ("MO", 1), ("MO", 2)])
+
+    async def test_translate_source_partials_are_not_held(self):
+        """The transcribe order does not touch translate: its source partials still go out at once."""
+        settings = dataclasses.replace(
+            make_settings(True, max_utterance_ms=40, use_language_source=True), translate_emit_source_partials=True
+        )
+        coordinator = EngineCoordinator(settings)
+        asr = FakeRuntime()
+        coordinator.runtime = asr
+        coordinator.translation_runtime = FakeTranslationRuntime()
+        coordinator.tts_runtime = FakeTtsRuntime()
+        rpc = coordinator.open_rpc()
+
+        def chunk(ts):
+            return request(ts, task="translate", language="en", language_source="vi")
+
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(0))
+        key = asr.commands[-1].key
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=1))
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(160))  # utt1 -> FINALIZE, not FINAL yet
+        await coordinator.accept_chunk(rpc.rpc_id, chunk(320))
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=2))
+        await coordinator._handle_runtime_result(
+            RuntimeResult(
+                type=RuntimeResultType.PARTIAL, key=key, utterance_id=2, text="xin chao",
+                metadata={"model_step_executed": True},
+            )
+        )
+        self.assertEqual([(e.utterance_id, e.is_final, e.text) for e in self._envs(rpc)], [(2, False, "xin chao")])
+        stream = coordinator._streams[key]
+        self.assertEqual((stream.stt_emit_next, stream.stt_held), (1, {}))
 
     async def test_earlier_final_with_nothing_left_after_its_segments_releases_the_later_one(self):
         """utt1 already sent its sentence as a segment and its FINAL adds nothing: utt2 must still be released."""
