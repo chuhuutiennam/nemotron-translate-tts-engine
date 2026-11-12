@@ -1318,6 +1318,15 @@ class EngineCoordinator:
         rpc.response_buffer.put(RpcFailure(code_name=code_name, details=details))
         await self.cancel_rpc(rpc_id, details)
 
+    def _stream_live(self, stream: StreamContext) -> bool:
+        """The stream is still registered and not closed (cancel_rpc/fail_rpc and _close_stream close and drop it).
+        Checked again after an await, during which another coroutine may have done that."""
+        return stream.phase is not StreamPhase.CLOSED and self._streams.get(stream.key) is stream
+
+    def _stream_open(self, stream: StreamContext) -> bool:
+        """Live and still taking new utterances (not CLOSING after close_input / end of stream)."""
+        return stream.phase is StreamPhase.OPEN and self._streams.get(stream.key) is stream
+
     async def _vad_process(
         self, stream: StreamContext, audio: np.ndarray, duration_ms: float
     ) -> VadEvent:
@@ -1380,6 +1389,9 @@ class EngineCoordinator:
                     DEFERRED_BACKLOG_MS.observe(stream.pre_roll.samples * 1000.0 / 16_000)
                 arrival = stream.last_activity
                 vad_event = await self._vad_process(stream, vad_audio, duration_ms)
+                if not self._stream_open(stream):
+                    # The RPC failed or the input closed while VAD ran (executor): open no utterance.
+                    return
                 if getattr(stream.vad, "speech_candidate_ms", 0.0) > 0.0:
                     if stream.speech_onset_wall <= 0.0:
                         stream.speech_onset_wall = arrival
@@ -1406,6 +1418,10 @@ class EngineCoordinator:
                 utt = stream.active_utterance
                 if not utt.final_requested:
                     vad_event = await self._vad_process(stream, vad_audio, duration_ms)
+                    if not self._stream_live(stream):
+                        # Cancelled while VAD ran: the utterance is gone. A CLOSING stream goes on: a FINALIZE
+                        # sent after a STEP still in flight takes this audio too.
+                        return
                     tail: tuple[np.ndarray, int, float, int] | None = None
                     tail_raw: np.ndarray | None = None
                     if vad_event is VadEvent.END and not end_of_stream:
@@ -1533,6 +1549,19 @@ class EngineCoordinator:
         source_samples: int,
         source_rate: int,
     ) -> None:
+        if not self._stream_open(stream):
+            # Callers check after their awaits; this keeps a closed or closing stream from ever sending START.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "VAD START dropped: stream no longer open",
+                    extra={
+                        "rpc_id": stream.key.rpc_id,
+                        "session_id": stream.key.session_id,
+                        "stream_id": stream.key.stream_id,
+                        "phase": stream.phase.name,
+                    },
+                )
+            return
         utt_limit = self.settings.max_concurrent_utterances
         if utt_limit > 0 and self._active_utterances_count >= utt_limit:
             await self.fail_rpc(
