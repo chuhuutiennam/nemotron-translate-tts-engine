@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import itertools
 import logging
 import math
@@ -9,6 +10,7 @@ import re
 import threading
 import time
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -80,22 +82,119 @@ class _PrioritizedCommand:
 
 
 def _command_priority(command_type: RuntimeCommandType) -> int:
-    # Free resources and close utterances before normal streaming work.
+    # Close utterances before normal streaming work. CANCEL never enters this queue (_CommandQueue.request_cancel).
     return {
         RuntimeCommandType.SHUTDOWN: -10,
-        RuntimeCommandType.CANCEL: 0,
         RuntimeCommandType.FINALIZE: 1,
         RuntimeCommandType.START: 2,
         RuntimeCommandType.STEP: 3,
     }[command_type]
 
 
+_StateKey = tuple[StreamKey, int]  # (stream, utterance_id): one model state
+
+
+def _state_key(command: RuntimeCommand) -> _StateKey | None:
+    return None if command.key is None else (command.key, command.utterance_id)
+
+
+class _CommandQueue:
+    """Model commands (bounded, by priority) and CANCEL requests (own path, never full) under one lock.
+
+    A CANCEL marks its (StreamKey, utterance_id) at once, on the caller's thread, and wakes the worker even when the
+    command queue is full. While marked, new commands of that utterance are refused; the worker takes the request
+    before any command, drops the queued commands of the utterance, frees its state and only then releases the mark.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._heap: list[_PrioritizedCommand] = []
+        self._cancel_requests: dict[_StateKey, None] = {}  # not yet taken by the worker, in arrival order
+        self._cancelled: set[_StateKey] = set()  # marked from request until release_cancel
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)  # wakes the worker: a command or a CANCEL request
+        self._not_full = threading.Condition(self._lock)
+
+    def qsize(self) -> int:
+        with self._lock:
+            return len(self._heap)
+
+    @property
+    def pending_cancellations(self) -> int:
+        with self._lock:
+            return len(self._cancelled)
+
+    def _marked(self, command: RuntimeCommand) -> bool:
+        state_key = _state_key(command)
+        return state_key is not None and state_key in self._cancelled
+
+    def put(self, item: _PrioritizedCommand, timeout: float | None) -> bool:
+        """Queue item, waiting up to timeout seconds for room (None: no limit, 0: no wait); raises queue.Full.
+
+        False when its utterance is cancelled: the command is dropped, not queued.
+        """
+        with self._not_full:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while not self._marked(item.command) and 0 < self._maxsize <= len(self._heap):
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise queue.Full
+                self._not_full.wait(remaining)
+            if self._marked(item.command):
+                return False
+            heapq.heappush(self._heap, item)
+            self._not_empty.notify()
+            return True
+
+    def request_cancel(self, state_key: _StateKey) -> bool:
+        """Mark the utterance cancelled and wake the worker; False when it is already marked."""
+        with self._lock:
+            if state_key in self._cancelled:
+                return False
+            self._cancelled.add(state_key)
+            self._cancel_requests[state_key] = None
+            self._not_empty.notify()
+            return True
+
+    def is_cancelled(self, state_key: _StateKey) -> bool:
+        with self._lock:
+            return state_key in self._cancelled
+
+    def release_cancel(self, state_key: _StateKey) -> None:
+        with self._lock:
+            self._cancelled.discard(state_key)
+
+    def get(self) -> tuple[list[tuple[_StateKey, int]], _PrioritizedCommand | None]:
+        """Wait for work. CANCEL requests come first, with their queued commands dropped:
+        ([(state_key, dropped commands)], None); otherwise ([], the next command)."""
+        with self._not_empty:
+            while not self._cancel_requests and not self._heap:
+                self._not_empty.wait()
+            if self._cancel_requests:
+                taken = list(self._cancel_requests)
+                self._cancel_requests.clear()
+                taken_set = set(taken)
+                dropped = Counter(_state_key(item.command) for item in self._heap)
+                kept = [item for item in self._heap if _state_key(item.command) not in taken_set]
+                if len(kept) != len(self._heap):
+                    heapq.heapify(kept)
+                    self._heap = kept
+                    self._not_full.notify_all()
+                return [(state_key, dropped[state_key]) for state_key in taken], None
+            item = heapq.heappop(self._heap)
+            self._not_full.notify()
+            return [], item
+
+
 class NemotronRuntime:
     """Single-owner runtime for Nemotron weights and all per-stream caches.
 
-    No gRPC/asyncio task may call NeMo directly. FINALIZE/CANCEL commands receive
+    No gRPC/asyncio task may call NeMo directly. FINALIZE commands receive
     higher priority than normal STEP work so a stream does not remain stuck in
-    FINALIZING while new audio accumulates in the deferred buffer.
+    FINALIZING while new audio accumulates in the deferred buffer. CANCEL does
+    not queue behind them: it is recorded on submit, wakes the worker, and the
+    worker drops the utterance's queued commands and frees its state before
+    confirming CANCELLED (also when the command queue is full).
     """
 
     def __init__(
@@ -123,9 +222,7 @@ class NemotronRuntime:
         self._result_callback = result_callback
         self.worker_id = worker_id
 
-        self._commands: queue.PriorityQueue[_PrioritizedCommand] = queue.PriorityQueue(
-            maxsize=queue_size
-        )
+        self._commands = _CommandQueue(maxsize=queue_size)
         self._sequence = itertools.count()
         self._thread = threading.Thread(
             target=self._run, name=f"nemotron-runtime-{worker_id}", daemon=True
@@ -154,6 +251,11 @@ class NemotronRuntime:
     def queue_depth(self) -> int:
         return self._commands.qsize()
 
+    @property
+    def pending_cancellations(self) -> int:
+        """Utterances whose CANCEL is recorded but not yet cleaned up by the worker."""
+        return self._commands.pending_cancellations
+
     def start(self, timeout: float = 300.0) -> None:
         self._thread.start()
         if not self._ready.wait(timeout=timeout):
@@ -168,33 +270,57 @@ class NemotronRuntime:
             command=command,
         )
 
+    def _enqueue(self, command: RuntimeCommand, timeout: float | None) -> None:
+        """Queue command, waiting up to timeout for room (raises queue.Full). CANCEL takes its own path and
+        never waits; a command of an utterance already cancelled is dropped."""
+        if command.type is RuntimeCommandType.CANCEL:
+            state_key = _state_key(command)
+            if state_key is None:
+                raise ValueError("CANCEL command requires a StreamKey")
+            if not self._commands.request_cancel(state_key):
+                self._log_dropped(command, "cancel already pending")
+            return
+        if not self._commands.put(self._wrap(command), timeout=timeout):
+            self._log_dropped(command, "utterance cancelled")
+        RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
+
     def submit(self, command: RuntimeCommand, timeout: float = 2.0) -> None:
         if self._stopped.is_set():
             raise QueueFullError("Nemotron runtime is stopped")
         try:
-            self._commands.put(self._wrap(command), timeout=timeout)
+            self._enqueue(command, timeout)
         except queue.Full as exc:
             raise QueueFullError("Nemotron runtime queue is full") from exc
-        RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
 
     def submit_nowait(self, command: RuntimeCommand) -> None:
         if self._stopped.is_set():
             raise QueueFullError("Nemotron runtime is stopped")
         try:
-            self._commands.put_nowait(self._wrap(command))
+            self._enqueue(command, 0)
         except queue.Full as exc:
             raise QueueFullError("Nemotron runtime queue is full") from exc
-        RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
 
     def try_submit_nowait(self, command: RuntimeCommand) -> SubmitStatus:
         if self._stopped.is_set():
             return SubmitStatus.UNAVAILABLE
         try:
-            self._commands.put_nowait(self._wrap(command))
-            RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
-            return SubmitStatus.ACCEPTED
+            self._enqueue(command, 0)
         except queue.Full:
             return SubmitStatus.OVERLOADED
+        return SubmitStatus.ACCEPTED
+
+    def _log_dropped(self, command: RuntimeCommand, reason: str) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Dropping ASR command (%s): worker=%s command=%s rpc=%s session=%s stream=%s utterance=%s",
+                reason,
+                self.worker_id,
+                command.type.name,
+                command.key.rpc_id if command.key else "",
+                command.key.session_id if command.key else "",
+                command.key.stream_id if command.key else "",
+                command.utterance_id,
+            )
 
     def shutdown(self, timeout: float = 10.0) -> None:
         if self._stopped.is_set():
@@ -235,8 +361,18 @@ class NemotronRuntime:
         logger.info("Nemotron runtime ready: worker=%s", self.worker_id)
 
         while True:
-            queued = self._commands.get()
+            cancels, queued = self._commands.get()
+            RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
+            if queued is None:
+                for state_key, dropped in cancels:
+                    self._finish_cancel(state_key, dropped)
+                continue
             command = queued.command
+            state_key = _state_key(command)
+            if state_key is not None and self._commands.is_cancelled(state_key):
+                # CANCEL came after this command left the queue: drop it; the next get() frees the state.
+                self._log_dropped(command, "utterance cancelled")
+                continue
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -247,7 +383,6 @@ class NemotronRuntime:
                     command.utterance_id,
                 )
 
-            RUNTIME_QUEUE.labels(worker=str(self.worker_id)).set(self._commands.qsize())
             self._queue_wait_ms = (time.perf_counter() - queued.enqueue_time) * 1000.0
             ASR_QUEUE_WAIT_MS.observe(self._queue_wait_ms)
             started = time.perf_counter()
@@ -282,10 +417,31 @@ class NemotronRuntime:
                     MODEL_STEP_SECONDS.labels(command=command.type.name).observe(
                         time.perf_counter() - started
                     )
-                self._commands.task_done()
 
         self._stopped.set()
         logger.info("Nemotron runtime stopped: worker=%s", self.worker_id)
+
+    def _finish_cancel(self, state_key: _StateKey, dropped: int) -> None:
+        """Free the state of a cancelled utterance (its queued commands are already dropped), release the mark,
+        then confirm CANCELLED: the pool frees the affinity on it."""
+        started = time.perf_counter()
+        key, utterance_id = state_key
+        freed = self._states.pop(state_key, None) is not None
+        self._commands.release_cancel(state_key)
+        MODEL_STEP_SECONDS.labels(command=RuntimeCommandType.CANCEL.name).observe(time.perf_counter() - started)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ASR utterance cancelled: worker=%s rpc=%s session=%s stream=%s utterance=%s "
+                "state_freed=%s dropped_commands=%s",
+                self.worker_id,
+                key.rpc_id,
+                key.session_id,
+                key.stream_id,
+                utterance_id,
+                freed,
+                dropped,
+            )
+        self._emit(RuntimeResult(type=RuntimeResultType.CANCELLED, key=key, utterance_id=utterance_id))
 
     def _load_model(self) -> None:
         import torch
@@ -478,25 +634,12 @@ class NemotronRuntime:
                 self._states.pop((command.key, command.utterance_id), None)
             return
 
-        if command.type is RuntimeCommandType.CANCEL:
-            state_key = (command.key, command.utterance_id)
-            self._states.pop(state_key, None)
-            self._emit(
-                RuntimeResult(
-                    type=RuntimeResultType.CANCELLED,
-                    key=command.key,
-                    utterance_id=command.utterance_id,
-                )
-            )
-            return
-
         state_key = (command.key, command.utterance_id)
         state = self._states.get(state_key)
 
         if state is None:
-            # CANCEL has higher queue priority than STEP/FINALIZE.
-            # When RPC is cancelled while STEP/FINALIZE already queued,
-            # CANCEL removes the state first — these are stale, not failures.
+            # Commands of a cancelled utterance are dropped before they get here (_CommandQueue);
+            # a STEP/FINALIZE without state left is stale (e.g. STARTED could not be delivered), not a failure.
             if command.type in (RuntimeCommandType.STEP, RuntimeCommandType.FINALIZE):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(

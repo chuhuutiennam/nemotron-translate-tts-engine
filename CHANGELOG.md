@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/{runtime,pools}.py`, `tests/test_runtime_cancel.py` (new, 7 tests), `docs/system-design.md` (5.4, 5.5, 7.2, 7.3): fix ASR state leaks on CANCEL.
+  - **Bugs fixed:**
+    - CANCEL before START: when an RPC was cancelled while its START still waited in the worker queue, CANCEL (priority 0) ran first and found no state. The START (priority 2) then created encoder caches that nobody freed, because the RPC and the pool affinity were already gone (RPC=0, owner=0, state=1). The key holds `rpc_id`, so the state stayed until restart.
+    - CANCEL with a full queue: `fail_rpc` -> `cancel_rpc` (e.g. "ASR queue full at utterance finalize") called `submit_nowait(CANCEL)` on the full queue. It raised `QueueFullError` ("Failed to cancel runtime utterance"), so state and affinity were never freed.
+  - **Change (`runtime.py`):** `_CommandQueue` replaces the `PriorityQueue`: a bounded command heap (`SHUTDOWN` > `FINALIZE` > `START` > `STEP`) and a separate CANCEL path under one lock.
+    - CANCEL marks `(StreamKey, utterance_id)` on the caller's thread and wakes the worker. It never waits for room, and a repeated CANCEL counts once.
+    - The worker takes cancel requests before any command. It drops the utterance's queued commands, frees its state, releases the mark and only then emits `CANCELLED`. Commands for a marked utterance are dropped at submit (still `ACCEPTED`) and before they run.
+    - `pending_cancellations`: CANCELs recorded and not yet cleaned up.
+    - Only the worker thread changes model state.
+  - **Change (`pools.py`):** `pending_cancellations` (sum over the workers). `_cancel_without_owner` replaces three copies of "CANCEL with no owner -> CANCELLED"; the blocking `submit()` now handles that case too, as `submit_nowait` did. Affinity is still released on `CANCELLED`, which now comes after the cleanup.
+  - **Behaviour to know:**
+    - A command already running when CANCEL arrives finishes and emits its result before `CANCELLED`; the coordinator drops it (stream gone).
+    - `asr_queue_wait_ms` no longer gets CANCEL samples; `MODEL_STEP_SECONDS{command="CANCEL"}` now times the cleanup.
+    - No on/off switch: this is a bug fix.
+  - **Verified:**
+    - Real pool and worker threads, model replaced. The repro of the first bug went from `CANCELLED, STARTED` with state 1 to `CANCELLED` with state 0.
+    - `tests/test_runtime_cancel.py` covers: CANCEL before START, during STEP, after FINAL (also when it reaches the worker before the affinity is released), repeated, with a full queue, waking an idle worker, and 300 random open/cancel cycles on 2 workers. Each test checks that state, affinity, cancellation marks and queue depth return to 0.
+    - pytest (Windows) 969 passed, 27 skipped; the new file passed 5 runs in a row.
+  - **Not yet done:** a run on the GPU server with the real model.
+
 - `src/nemotron_testbed/{audx_model,audio_preprocess_runtime,config}.py`, `etc/nemotron-engine.yaml`, the three ConfigMaps, `scripts/{probe_audx.py,canary_preproc.sh}`, `tests/{test_audx_model,test_config_yaml}.py`, `README.md`, `docs/{audx-stateful-design (status, decisions 8/9/15, 4, 8, 9 new),scripts-guide (4.6, 5.1),server-setup-guide (B, model audx),system-design}.md`: AudX AGC ceiling and clamp of the model output.
   - **Why:** the first real `trace_pcap` from the server (2026-11-03, a clean call, 52% digital zero) showed two faults of mode `audx`:
     - the first word of the call was cut 13–18 dB: a −61 dBFS click set the AGC level, the gain rose to +23 dB and the model got +14 dBFS peaks;
