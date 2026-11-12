@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import numpy as np
 from nemotron_testbed.config import Settings
 from nemotron_testbed.coordinator import EngineCoordinator, RecognitionEnvelope
 from nemotron_testbed.metrics import (
+    ACTIVE_UTTERANCES,
     EMPTY_RESULTS_SKIPPED,
     SEGMENT_ERRORS,
     SEGMENT_PHASE_MS,
@@ -909,6 +911,176 @@ class RejectOnceTtsRuntime(FakeTtsRuntime):
             return SubmitStatus.OVERLOADED
         self.jobs.append(job)
         return SubmitStatus.ACCEPTED
+
+
+class _ExecutorVad:
+    """Same interface as VadController; like Silero it runs in the executor (needs_executor), and it waits for
+    `release` so a test can run fail_rpc / close_input / cancel_rpc while the coordinator awaits it."""
+
+    needs_executor = True
+    speech_candidate_ms = 0.0
+    end_tail_ms = 0.0
+    end_silence_observed_ms = 0.0
+    max_score = 0.0
+
+    def __init__(self, event):
+        self.event = event
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def process(self, audio, duration_ms):
+        self.entered.set()
+        if not self.release.wait(5):
+            raise RuntimeError("VAD never released")
+        return self.event
+
+    def reset(self):
+        pass
+
+
+class VadAwaitRaceTest(unittest.IsolatedAsyncioTestCase):
+    """While the coordinator awaits an executor VAD, the RPC can fail or the input close. A START coming back
+    after that must not open an utterance: before the fix it did, leaving an ASR state, a pool affinity and
+    _active_utterances_count behind (or, on a CLOSING stream, an utterance that never finalizes)."""
+
+    def _coordinator(self, runtime=None, **overrides):
+        # min speech 40 ms: a silent first chunk opens no utterance (with 0 the energy VAD starts on anything)
+        fields = dict(vad_enabled=True, vad_backend="energy", vad_min_speech_ms=40)
+        fields.update(overrides)
+        coordinator = EngineCoordinator(dataclasses.replace(make_settings(False), **fields))
+        coordinator.runtime = runtime if runtime is not None else FakeRuntime()
+        return coordinator
+
+    @staticmethod
+    def _silent(ts):
+        chunk = request(ts)
+        chunk.pcm = np.zeros(320, dtype="<i2").tobytes()
+        return chunk
+
+    async def _race(self, coordinator, rpc, chunk, event, during):
+        """Feed `chunk` with an executor VAD returning `event`, and run `during()` while it is being awaited."""
+        stream = next(iter(coordinator._streams.values()))
+        vad = stream.vad = _ExecutorVad(event)
+        task = asyncio.create_task(coordinator.accept_chunk(rpc.rpc_id, chunk))
+        self.assertTrue(await asyncio.to_thread(vad.entered.wait, 5))
+        await during()
+        vad.release.set()
+        await task
+        return stream
+
+    @staticmethod
+    def _starts(runtime):
+        return [c for c in runtime.commands if c.type.name == "START"]
+
+    async def test_fail_rpc_while_vad_runs_opens_no_utterance(self):
+        coordinator = self._coordinator()
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, self._silent(0))  # the stream, no utterance yet
+        gauge = ACTIVE_UTTERANCES._value.get()
+
+        stream = await self._race(
+            coordinator, rpc, request(160), VadEvent.START, lambda: coordinator.fail_rpc(rpc.rpc_id, "INTERNAL", "x")
+        )
+        self.assertEqual(self._starts(coordinator.runtime), [])
+        self.assertIsNone(stream.active_utterance)
+        self.assertEqual(coordinator._active_utterances_count, 0)
+        self.assertEqual(ACTIVE_UTTERANCES._value.get(), gauge)
+
+    async def test_fail_rpc_while_vad_runs_leaves_no_asr_state_or_affinity(self):
+        """The reported case with the real pool and worker: RPC 0, stream 0, and also state 0, owner 0."""
+        from test_runtime_cancel import GatedRuntime
+        from nemotron_testbed.pools import NemotronRuntimePool
+
+        results = []
+        pool = NemotronRuntimePool(
+            workers=1, model_path="", devices=["cpu"], language="vi-VN", left_context=56, lookahead_tokens=6,
+            queue_size=16, warmup_seconds=0.0, result_callback=results.append, runtime_factory=GatedRuntime,
+        )
+        pool.start(timeout=5)
+        self.addCleanup(pool.shutdown, 5)
+        coordinator = self._coordinator(runtime=pool)
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, self._silent(0))
+
+        await self._race(
+            coordinator, rpc, request(160), VadEvent.START, lambda: coordinator.fail_rpc(rpc.rpc_id, "INTERNAL", "x")
+        )
+        await asyncio.sleep(0.2)  # a START would have run by now
+        self.assertEqual((len(coordinator._rpcs), len(coordinator._streams)), (0, 0))
+        self.assertEqual((len(pool._runtimes[0]._states), pool.active_owners), (0, 0))
+        self.assertEqual(coordinator._active_utterances_count, 0)
+        self.assertEqual(results, [])
+
+    async def test_close_input_while_vad_runs_closes_the_stream(self):
+        coordinator = self._coordinator()
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, self._silent(0))
+        key = next(iter(coordinator._streams))
+
+        await self._race(coordinator, rpc, request(160), VadEvent.START, lambda: coordinator.close_input(rpc.rpc_id))
+        self.assertEqual(self._starts(coordinator.runtime), [])
+        self.assertEqual(coordinator._active_utterances_count, 0)
+        self.assertNotIn(key, coordinator._streams)
+        self.assertTrue(rpc.response_buffer._closed)
+        self.assertNotIn(rpc.rpc_id, coordinator._rpcs)
+
+    async def test_close_input_while_vad_runs_with_an_utterance_finishing_does_not_hang(self):
+        # min speech 0: START on the first chunk; the pre-roll then holds 1 sample (0 + 0 ms)
+        coordinator = self._coordinator(vad_min_speech_ms=0, max_utterance_ms=20)
+        asr = coordinator.runtime
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, request(0))  # energy VAD: START utt1
+        key = asr.commands[-1].key
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=1))
+        await coordinator.accept_chunk(rpc.rpc_id, request(160))  # past 20 ms: utt1 -> FINALIZE, now finishing
+        self.assertEqual((asr.commands[-1].type.name, asr.commands[-1].utterance_id), ("FINALIZE", 1))
+
+        stream = await self._race(
+            coordinator, rpc, request(320), VadEvent.START, lambda: coordinator.close_input(rpc.rpc_id)
+        )
+        self.assertIs(stream.phase, StreamPhase.CLOSING)
+        self.assertEqual([c.utterance_id for c in self._starts(asr)], [1])  # no START for a second utterance
+        self.assertIsNone(stream.active_utterance)
+
+        await coordinator._handle_runtime_result(
+            RuntimeResult(type=RuntimeResultType.FINAL, key=key, utterance_id=1, text="xin chao")
+        )
+        self.assertNotIn(key, coordinator._streams)  # closed after utt1's FINAL, not left waiting
+        self.assertTrue(rpc.response_buffer._closed)
+        self.assertEqual(coordinator._active_utterances_count, 0)
+
+    async def test_cancel_while_vad_runs_on_an_active_utterance_stops_there(self):
+        coordinator = self._coordinator(vad_min_speech_ms=0)  # START on the first chunk
+        asr = coordinator.runtime
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, request(0))  # START utt1
+        key = asr.commands[-1].key
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=1))
+        utt = coordinator._streams[key].active_utterance
+        samples = utt.model_audio.samples
+        traces = []
+        coordinator._trace = lambda stage, *args, **kwargs: traces.append(stage)
+
+        await self._race(
+            coordinator, rpc, request(160), VadEvent.END, lambda: coordinator.cancel_rpc(rpc.rpc_id, "client gone")
+        )
+        self.assertEqual(asr.commands[-1].type.name, "CANCEL")  # nothing after the CANCEL
+        self.assertNotIn("VAD_END", traces)
+        self.assertFalse(utt.final_requested)
+        self.assertEqual(utt.model_audio.samples, samples)  # no audio added to the cancelled utterance
+
+    async def test_start_from_an_executor_vad_on_an_open_stream_still_opens_the_utterance(self):
+        coordinator = self._coordinator()
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, self._silent(0))
+
+        async def nothing():
+            pass
+
+        stream = await self._race(coordinator, rpc, request(160), VadEvent.START, nothing)
+        self.assertEqual([c.utterance_id for c in self._starts(coordinator.runtime)], [1])
+        self.assertIsNotNone(stream.active_utterance)
+        self.assertEqual(coordinator._active_utterances_count, 1)
 
 
 class TranscribeOrderTest(unittest.IsolatedAsyncioTestCase):

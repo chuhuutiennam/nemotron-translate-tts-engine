@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/coordinator.py`, `tests/test_coordinator_flow.py` (6 new tests), `docs/system-design.md` (5.2): a VAD START that comes back after the RPC failed or the input closed no longer opens an utterance.
+  - **Bug fixed:** with an executor VAD (Silero), `_process_audio` awaits the VAD, and `fail_rpc` / `cancel_rpc` or `close_input` can run meanwhile. The branch without an utterance had checked `phase is OPEN` before the await and then called `_start_utterance`. Reproduced with the real pool and worker: after `fail_rpc` the RPC and the stream were gone (`CLOSED`), yet the START left an ASR state, a pool affinity and `_active_utterances_count` 1 (and the `ACTIVE_UTTERANCES` gauge), with nobody to cancel them.
+  - **Same cause, found while reading:** `close_input` during the await either closed the stream (the same leak), or, with an utterance still finishing, left the stream `CLOSING` with a new utterance that never finalizes, so the RPC hung until `rpc_max_idle_s`.
+  - **Change:** new `_stream_live` (not `CLOSED`, still in `_streams`) and `_stream_open` (also `OPEN`).
+    - After the VAD await, the branch without an utterance returns unless `_stream_open`; `_start_utterance` checks it too, with a DEBUG log "VAD START dropped: stream no longer open".
+    - The branch with an utterance returns unless `_stream_live`, so it no longer adds audio to a cancelled utterance or traces `VAD_END` for it. A `CLOSING` stream goes on there: a FINALIZE sent after a STEP still in flight takes that audio.
+  - **Tests:** new `VadAwaitRaceTest` with an executor VAD stand-in (`needs_executor`, waits for a release):
+    - `fail_rpc` during the await (no START, counter and gauge unchanged; with the real pool: state 0, owner 0, no STARTED);
+    - `close_input` with nothing finishing (stream and RPC closed);
+    - `close_input` with an utterance finishing (no second START; the stream closes at that utterance's FINAL);
+    - `cancel_rpc` on an active utterance (nothing after CANCEL, no `VAD_END`, no audio added);
+    - an executor START on an open stream still opens the utterance.
+  - **Verified:** on master's coordinator the first five fail (START sent, state/owner (1, 1), `[1, 2]` STARTs, `VAD_END`); the last passes there too. pytest (Windows) 997 passed, 27 skipped; the class passed 5 runs in a row.
+  - **Note:** with `vad_min_speech_ms` 0 the energy VAD starts even on a silent chunk; the tests use 40 ms where the first chunk must not start.
+
 - `src/nemotron_testbed/runtime.py`, `tests/test_runtime_cancel.py` (5 new tests), `docs/system-design.md` (5.5): a START waiting for queue room no longer runs after CANCEL.
   - **Bug fixed:** a blocking `submit(timeout=…)` waits for room in `_CommandQueue.put()`, outside the heap. When the utterance was cancelled meanwhile, the worker purged the heap (the START was not in it), freed the state, released the mark and emitted CANCELLED, and the pool dropped the affinity. When room came, the producer woke up, saw no mark and queued the START, so the result was `CANCELLED` → `STARTED`, with a state left and no affinity. Reproduced with the real pool and worker. Only `NemotronRuntimePool.submit()` takes this path; the coordinator uses `submit_nowait` / `try_submit_nowait`, which never wait.
   - **Change:**
