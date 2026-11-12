@@ -910,6 +910,109 @@ class RejectOnceTtsRuntime(FakeTtsRuntime):
         return SubmitStatus.ACCEPTED
 
 
+class TranscribeOrderTest(unittest.IsolatedAsyncioTestCase):
+    """Transcribe results go out in utterance order: with several ASR workers utt2 can reach FINAL before utt1.
+
+    The proto result has no utterance_id; clients and eval_wer.py join FINALs in the order received.
+    """
+
+    SENT = "This is a complete sentence here."
+
+    async def _two_utterances(self, *, segmentation=False, utt1_partials=(), utt2_partials=()):
+        settings = make_settings(False, max_utterance_ms=40, segmentation_mode="on" if segmentation else "off")
+        settings = dataclasses.replace(settings, segmentation_speech_to_text=segmentation)
+        coordinator = EngineCoordinator(settings)
+        asr = FakeRuntime()
+        coordinator.runtime = asr
+        rpc = coordinator.open_rpc()
+
+        async def partials(utterance_id, texts):
+            for text in texts:
+                await coordinator._handle_runtime_result(
+                    RuntimeResult(
+                        type=RuntimeResultType.PARTIAL, key=key, utterance_id=utterance_id, text=text,
+                        metadata={"model_step_executed": True},
+                    )
+                )
+
+        await coordinator.accept_chunk(rpc.rpc_id, request(0, language="en"))
+        key = asr.commands[-1].key
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=1))
+        await partials(1, utt1_partials)
+        await coordinator.accept_chunk(rpc.rpc_id, request(160, language="en"))
+        self.assertEqual((asr.commands[-1].type.name, asr.commands[-1].utterance_id), ("FINALIZE", 1))
+        await coordinator.accept_chunk(rpc.rpc_id, request(320, language="en"))
+        await coordinator._handle_runtime_result(RuntimeResult(type=RuntimeResultType.STARTED, key=key, utterance_id=2))
+        await partials(2, utt2_partials)
+        await coordinator.accept_chunk(rpc.rpc_id, request(480, end=True, language="en"))
+        self.assertEqual((asr.commands[-1].type.name, asr.commands[-1].utterance_id), ("FINALIZE", 2))
+        return coordinator, rpc, key
+
+    @staticmethod
+    def _envs(rpc):
+        return [item for item in rpc.response_buffer._items if isinstance(item, RecognitionEnvelope)]
+
+    async def _final(self, coordinator, key, utterance_id, text):
+        await coordinator._handle_runtime_result(
+            RuntimeResult(type=RuntimeResultType.FINAL, key=key, utterance_id=utterance_id, text=text)
+        )
+
+    async def test_later_final_waits_for_the_earlier_one(self):
+        coordinator, rpc, key = await self._two_utterances()
+        await self._final(coordinator, key, 2, "cau hai")
+        self.assertEqual(self._envs(rpc), [])  # held: utt1 has not emitted its FINAL
+        await self._final(coordinator, key, 1, "cau mot")
+        envs = self._envs(rpc)
+        self.assertEqual([(e.utterance_id, e.text, e.is_final) for e in envs], [(1, "cau mot", True), (2, "cau hai", True)])
+        self.assertEqual([e.seq for e in envs], [1, 2])
+        stream = coordinator._streams.get(key)
+        self.assertTrue(stream is None or not stream.stt_held)
+
+    async def test_held_partials_keep_only_the_latest(self):
+        coordinator, rpc, key = await self._two_utterances(utt2_partials=["cau", "cau hai"])
+        self.assertEqual(self._envs(rpc), [])  # utt2 partials held while utt1 is unfinished
+        await self._final(coordinator, key, 1, "cau mot")
+        self.assertEqual(
+            [(e.utterance_id, e.text, e.is_final) for e in self._envs(rpc)],
+            [(1, "cau mot", True), (2, "cau hai", False)],
+        )
+        await self._final(coordinator, key, 2, "cau hai xong")
+        self.assertEqual(
+            [(e.utterance_id, e.text, e.is_final) for e in self._envs(rpc)],
+            [(1, "cau mot", True), (2, "cau hai", False), (2, "cau hai xong", True)],
+        )
+
+    async def test_empty_earlier_final_still_releases_the_later_one(self):
+        coordinator, rpc, key = await self._two_utterances()
+        await self._final(coordinator, key, 2, "cau hai")
+        await self._final(coordinator, key, 1, "")
+        self.assertEqual([(e.utterance_id, e.text) for e in self._envs(rpc)], [(2, "cau hai")])
+
+    async def test_held_segments_keep_their_order(self):
+        coordinator, rpc, key = await self._two_utterances(
+            segmentation=True, utt2_partials=[self.SENT, self.SENT, self.SENT + " and more"]
+        )
+        self.assertEqual(self._envs(rpc), [])  # utt2's committed sentence is held too
+        await self._final(coordinator, key, 1, "cau mot.")
+        await self._final(coordinator, key, 2, self.SENT + " and more words")
+        envs = self._envs(rpc)
+        self.assertEqual(
+            [(e.utterance_id, e.is_final, e.text) for e in envs],
+            [(1, True, "cau mot."), (2, True, self.SENT), (2, False, "and more"), (2, True, "and more words")],
+        )
+        self.assertEqual([e.seq for e in envs], [1, 2, 3, 4])
+
+    async def test_earlier_final_with_nothing_left_after_its_segments_releases_the_later_one(self):
+        """utt1 already sent its sentence as a segment and its FINAL adds nothing: utt2 must still be released."""
+        coordinator, rpc, key = await self._two_utterances(segmentation=True, utt1_partials=[self.SENT, self.SENT])
+        self.assertEqual([(e.utterance_id, e.is_final, e.text) for e in self._envs(rpc)][-1], (1, True, self.SENT))
+        await self._final(coordinator, key, 2, "cau hai.")
+        self.assertNotIn(2, [e.utterance_id for e in self._envs(rpc)])
+        await self._final(coordinator, key, 1, self.SENT)  # nothing after the committed sentence
+        envs = self._envs(rpc)
+        self.assertEqual([(e.utterance_id, e.is_final, e.text) for e in envs if e.is_final], [(1, True, self.SENT), (2, True, "cau hai.")])
+
+
 class TtsPhraseContinuationTest(unittest.IsolatedAsyncioTestCase):
     async def test_continuation_phrase_survives_transient_full_queue(self):
         """A transiently full TTS queue must not drop the rest of a multi-phrase utterance.
