@@ -1549,11 +1549,12 @@ class EngineCoordinator:
             utt.source_audio.append(raw_initial)
         utt.samples += initial_audio.size
 
-        # pre_roll is at 16 kHz internal rate; convert to RTP clock ticks.
-        pre_roll_rtp_ticks = int(round(initial_audio.size * stream.rtp_clock_rate / 16_000))
-        utt.ts_start = self._rtp_add(rtp_timestamp, -pre_roll_rtp_ticks)
         rtp_ticks = int(round(source_samples * stream.rtp_clock_rate / source_rate))
         utt.ts_end = self._rtp_add(rtp_timestamp, rtp_ticks)
+        # The pre-roll already holds this chunk, so it ends where this chunk ends (ts_end), not where it starts.
+        # pre_roll is at 16 kHz internal rate; convert to RTP clock ticks.
+        pre_roll_rtp_ticks = int(round(initial_audio.size * stream.rtp_clock_rate / 16_000))
+        utt.ts_start = self._rtp_add(utt.ts_end, -pre_roll_rtp_ticks)
 
         stream.active_utterance = utt
         ACTIVE_UTTERANCES.inc()

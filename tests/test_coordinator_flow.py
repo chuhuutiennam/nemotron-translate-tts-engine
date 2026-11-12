@@ -1659,12 +1659,13 @@ class RtpClockRateTest(unittest.IsolatedAsyncioTestCase):
         """ts_start / ts_end in the recognition result must be in RTP clock ticks.
 
         Setup (VAD disabled, vad_pre_roll_ms=0 so pre_roll = exactly 1 chunk):
-          chunk 0 ts=1000 → START.  pre_roll=320 PCM → 160 RTP ticks.
-            ts_start = 1000 − 160 = 840
+          chunk 0 ts=1000 → START.  pre_roll=320 PCM → 160 RTP ticks, and it holds chunk 0 itself.
             ts_end   = 1000 + 160 = 1160
+            ts_start = ts_end − 160 = 1000 (the pre-roll ends where chunk 0 ends)
           chunk 1 ts=1160, end_of_stream → ts_end = 1160 + 160 = 1320
 
-        Without fix: ts_start = 680, ts_end = 1480.
+        Counting the clock rate wrong gave ts_start = 680, ts_end = 1480; subtracting the pre-roll
+        from the start of chunk 0 instead of its end gave ts_start = 840.
         """
         coordinator = self._coordinator()
         fake = coordinator.runtime
@@ -1684,8 +1685,48 @@ class RtpClockRateTest(unittest.IsolatedAsyncioTestCase):
 
         result = await rpc.response_buffer.get()
         self.assertIsInstance(result, RecognitionEnvelope)
-        self.assertEqual(result.ts_start, 840)   # 1000 − 160, not 1000 − 320
+        self.assertEqual(result.ts_start, 1000)  # start of chunk 0, not 1000 − 160
         self.assertEqual(result.ts_end,   1320)  # 1160 + 160, not 1160 + 320
+
+    async def test_ts_start_of_a_first_chunk_at_zero_does_not_wrap(self):
+        coordinator = self._coordinator()
+        rpc = coordinator.open_rpc()
+        await coordinator.accept_chunk(rpc.rpc_id, self._chunk(0))
+        utt = coordinator._streams[self._key(rpc)].active_utterance
+        self.assertEqual((utt.ts_start, utt.ts_end), (0, 160))  # was 2**32 − 160
+
+    async def test_ts_start_is_the_first_chunk_in_a_multi_chunk_pre_roll(self):
+        """Energy VAD, pre-roll 40 + min speech 40 = 80 ms = 4 chunks of 20 ms (16 kHz clock: 320 ticks each).
+
+        At VAD START the pre-roll ends at the end of the START chunk k and holds chunks k-3..k, so
+        ts_start is the timestamp of chunk k-3.
+        """
+        coordinator = self._coordinator(
+            vad_enabled=True, vad_backend="energy", vad_min_speech_ms=40, vad_pre_roll_ms=40
+        )
+        rpc = coordinator.open_rpc()
+
+        def chunk(index, amplitude):
+            return SimpleNamespace(
+                session_id="s1", stream_id="A",
+                pcm=np.full(320, amplitude, dtype="<i2").tobytes(),
+                sample_rate=16000, channels=1,
+                rtp_timestamp=10_000 + index * 320, rtp_clock_rate=16000, chunk_seq=-1,
+                duration_ms=20, end_of_stream=False, language="vi", task="transcribe",
+            )
+
+        start_index = None
+        for index in range(12):
+            await coordinator.accept_chunk(rpc.rpc_id, chunk(index, 0 if index < 6 else 1000))
+            stream = coordinator._streams[self._key(rpc)]
+            if stream.active_utterance is not None:
+                start_index = index
+                break
+        self.assertIsNotNone(start_index)
+        utt = stream.active_utterance
+        self.assertEqual(utt.model_audio.samples, 4 * 320)
+        self.assertEqual(utt.ts_end, 10_000 + (start_index + 1) * 320)
+        self.assertEqual(utt.ts_start, 10_000 + (start_index - 3) * 320)
 
     async def test_rtp_gap_silence_pcm_samples_from_rtp_clock(self):
         """Gap of 160 RTP ticks @ 8 kHz = 20 ms → 320 PCM silence samples (not 160).
