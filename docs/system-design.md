@@ -406,6 +406,17 @@ sequenceDiagram
 - `tts_skip`: slot sẽ không bao giờ có TTS.
 - `utt_total`: số segment của mỗi utterance. Ở chế độ `segmentation.mode: on`, tổng này chỉ biết sau ASR FINAL; chưa biết thì con trỏ không nhảy sang utterance kế (`open_utts` giữ các utterance chưa biết tổng). Khi không tách câu, mỗi utterance mặc định có đúng một slot.
 
+Vòng đời (`_ensure_pipeline_order`, `_pipeline_order_cleanup`):
+
+- **Tạo:** `PipelineOrderState` được tạo khi một utterance dịch bắt đầu (`_start_utterance`), không đợi tới job dịch đầu tiên. Con trỏ bắt đầu ở utterance thấp nhất chưa xong (`min(utterance_id, các utterance đang kết thúc)`).
+- **Ghi nhận kết thúc:** mọi cách kết thúc của một utterance đều được ghi vào order:
+  - qua dịch: job, `utt_total`;
+  - ASR rỗng: `fallback_ready` rỗng cùng `tts_skip`;
+  - passthrough: `fallback_ready` chứa audio gốc.
+  Passthrough vì vậy cũng chờ các câu trước, không phát thẳng.
+- **Xoá:** chỉ khi hết việc downstream (`ready`, `fallback_ready`, `translation_pending`, `tts_skip`, `open_utts`, job) **và** stream không còn utterance nào đang chạy hoặc đang kết thúc.
+- **Trước bản sửa:** order chỉ được tạo ở job dịch đầu tiên và bị xoá ngay khi hết job. FINAL rỗng hoặc passthrough về trước (ví dụ FINAL 2 rỗng → 1 → 3) thì bị mất dấu kết thúc (rỗng) hoặc phát ngay (passthrough, ra 2 → 1). Order tạo sau đó chờ mãi slot 2, nên câu 3 đã dịch mà không được gửi TTS, `pending_postprocess` kẹt ở 1 và RPC không kết thúc.
+
 ### 7.2 Backpressure và giới hạn
 
 | Cơ chế | Hành vi |

@@ -1597,6 +1597,10 @@ class EngineCoordinator:
         pre_roll_rtp_ticks = int(round(initial_audio.size * stream.rtp_clock_rate / 16_000))
         utt.ts_start = self._rtp_add(utt.ts_end, -pre_roll_rtp_ticks)
 
+        if utt.task == TASK_REALTIME_TRANSLATION:
+            # The playback order exists from the start of the utterance, so an end that never reaches
+            # translation (empty ASR, passthrough) is recorded in it even if it is the first FINAL.
+            self._ensure_pipeline_order(stream, utt.utterance_id)
         stream.active_utterance = utt
         ACTIVE_UTTERANCES.inc()
         utt.active_gauge_held = True
@@ -1945,9 +1949,9 @@ class EngineCoordinator:
                         reason="asr_empty",
                         text=utt.latest_text,
                     )
-                    order = self._pipeline_order.get(stream.key)
+                    order = self._ensure_pipeline_order(stream, utt.utterance_id)
                     slot = self._slot_for(stream.key, utt.utterance_id)
-                    if order is not None and slot >= order.next_emit_slot:
+                    if slot >= order.next_emit_slot:
                         if segmented:
                             order.set_total(utt.utterance_id, 1)
                         order.fallback_ready[slot] = _FallbackEmit(
@@ -2072,7 +2076,7 @@ class EngineCoordinator:
             self._trace(
                 "DEGRADE", stream.key, utt.utterance_id, reason="asr_empty", text=utt.latest_text
             )
-        order = self._pipeline_order.get(stream.key)
+        order = self._ensure_pipeline_order(stream, utt.utterance_id)
         slot = self._slot_for(stream.key, utt.utterance_id)
         fallback = _FallbackEmit(
             utterance_id=utt.utterance_id,
@@ -2086,7 +2090,7 @@ class EngineCoordinator:
             audio_pt=audio_pt,
             speech_end_wall=utt.speech_end_wall,
         )
-        if order is None or slot < order.next_emit_slot:
+        if slot < order.next_emit_slot:  # already passed (not expected): nothing to wait for
             if has_text:
                 self._emit_recognition(
                     key=stream.key,
@@ -2610,18 +2614,7 @@ class EngineCoordinator:
             segment_idx=segment_idx,
         )
         self._pipeline_job_add(job_key, state)
-        # Start ordering at the lowest unresolved utterance: with several ASR
-        # workers a later utterance can reach FINAL before an earlier one that is
-        # still finishing, and that earlier one must not be stranded behind it.
-        first_uid = min([utt.utterance_id, *self._finishing.get(stream.key, ())])
-        order = self._pipeline_order.setdefault(
-            stream.key,
-            PipelineOrderState(
-                next_emit_slot=self._slot_for(stream.key, first_uid),
-                next_tts_slot=self._slot_for(stream.key, first_uid),
-                segmented=segmented,
-            ),
-        )
+        order = self._ensure_pipeline_order(stream, utt.utterance_id)
         if segmented:
             if utt_total is None:
                 order.open_utts.add(utt.utterance_id)
@@ -3006,10 +2999,32 @@ class EngineCoordinator:
             # Degraded: try the next utterance.
             order.advance_tts()
 
+    def _ensure_pipeline_order(self, stream: StreamContext, utterance_id: int) -> PipelineOrderState:
+        """The stream's playback order, created at the start of a translate utterance (or here if missing).
+
+        It starts at the lowest unresolved utterance: with several ASR workers a later utterance can reach FINAL
+        before an earlier one that is still finishing, and that earlier one must not be stranded behind it.
+        Every utterance records its end in it (translation, empty ASR, passthrough), so a cursor never waits on
+        an utterance whose end was not recorded.
+        """
+        order = self._pipeline_order.get(stream.key)
+        if order is None:
+            first_uid = min([utterance_id, *self._finishing.get(stream.key, ())])
+            order = self._pipeline_order[stream.key] = PipelineOrderState(
+                next_emit_slot=self._slot_for(stream.key, first_uid),
+                next_tts_slot=self._slot_for(stream.key, first_uid),
+                segmented=self.settings.segmentation_mode == "on",
+            )
+        return order
+
     def _pipeline_order_cleanup(self, key: StreamKey) -> None:
-        """Remove PipelineOrderState when all pipeline work for the stream is done."""
+        """Remove PipelineOrderState when all pipeline work for the stream is done and no utterance of the
+        stream is still in ASR (active or finishing): those will record their end in it."""
         order = self._pipeline_order.get(key)
         if order is None:
+            return
+        stream = self._streams.get(key)
+        if stream is not None and (stream.active_utterance is not None or self._finishing.get(key)):
             return
         if (
             not order.ready

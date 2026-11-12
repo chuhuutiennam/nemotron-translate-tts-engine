@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/coordinator.py`, `tests/test_coordinator_flow.py` (5 new tests), `docs/system-design.md` (7.1): the translate playback order exists from the start of an utterance, so an empty ASR result or a passthrough reaching FINAL first no longer blocks later utterances or plays out of order.
+  - **Bugs fixed:** `PipelineOrderState` was created only by the first translation job, and dropped as soon as no job was left.
+    - **[P1] Empty ASR first:** with FINAL 2 (empty) → 1 → 3, the empty branch recorded nothing (no order yet). The order created at utterance 1 then waited on slot 2 for ever: utterance 3 was translated but never sent to TTS, `pending_postprocess` stayed 1, and the RPC never finished.
+    - **[P2] Passthrough first:** with utterance 2 in the target language (original audio) reaching FINAL first, it was emitted at once, so the output came out 2 → 1, and utterance 3 was stuck the same way.
+    - Both were reproduced with the real coordinator and fake ASR/translation/TTS, with `segmentation.mode` off and on.
+  - **Change:**
+    - New `_ensure_pipeline_order` (the old `first_uid` / `setdefault` logic, now shared). `_start_utterance` calls it for translate utterances.
+    - The empty-ASR branch and `_passthrough_utterance` always record into the order (`fallback_ready` + `_skip_tts_slot` + drain) instead of skipping or emitting at once.
+    - `_pipeline_order_cleanup` also waits until the stream has no utterance active or finishing.
+    - Passthrough now waits for earlier utterances' translation and TTS (in order), so it can come out later than before when an earlier utterance is still in translation or TTS.
+  - **Tests:** new `PipelineOrderFromStartTest`:
+    - empty FINAL first, segmentation off and on;
+    - passthrough FINAL first, off and on (held, then 1 → 2 → 3);
+    - a lone passthrough is emitted at once;
+    - a lone empty FINAL finishes the RPC;
+    - the order is kept while utterances are in ASR and dropped when the stream is idle.
+    The two reported cases and the order-kept test failed on the old code (TTS jobs `['Hello']`; `(2, 'xin chao')` emitted first; order already dropped); the two lone-utterance tests passed there (regression guards). Rerunning the reproduction: 1 → 3 and 1 → 2 → 3, `pending_postprocess` 0, RPC finished. pytest (Windows) 1002 passed, 27 skipped.
+
 - `src/nemotron_testbed/coordinator.py`, `tests/test_coordinator_flow.py` (6 new tests), `docs/system-design.md` (5.2): a VAD START that comes back after the RPC failed or the input closed no longer opens an utterance.
   - **Bug fixed:** with an executor VAD (Silero), `_process_audio` awaits the VAD, and `fail_rpc` / `cancel_rpc` or `close_input` can run meanwhile. The branch without an utterance had checked `phase is OPEN` before the await and then called `_start_utterance`. Reproduced with the real pool and worker: after `fail_rpc` the RPC and the stream were gone (`CLOSED`), yet the START left an ASR state, a pool affinity and `_active_utterances_count` 1 (and the `ACTIVE_UTTERANCES` gauge), with nobody to cancel them.
   - **Same cause, found while reading:** `close_input` during the await either closed the stream (the same leak), or, with an utterance still finishing, left the stream `CLOSING` with a new utterance that never finalizes, so the RPC hung until `rpc_max_idle_s`.
