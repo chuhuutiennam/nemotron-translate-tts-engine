@@ -315,6 +315,14 @@ class UtteranceContext:
 
 
 @dataclass(slots=True)
+class _SttHeld:
+    """Transcribe results of one utterance held until every earlier utterance has emitted its FINAL."""
+
+    items: list[dict] = field(default_factory=list)  # _emit_recognition kwargs, in order; a partial only last
+    done: bool = False  # its FINAL was handled (emitted, or nothing to emit)
+
+
+@dataclass(slots=True)
 class StreamContext:
     key: StreamKey
     settings: Settings
@@ -344,6 +352,10 @@ class StreamContext:
     preprocessor: StreamAudioPreprocessor | StatefulStreamPreprocessor | None = None
     raw_pre_roll: SampleBuffer | None = None  # raw_aligned twin of pre_roll, only with a preprocessor
     pcap_trace: StreamTrace | None = None  # trace_pcap.enabled: pcap of the audio received and after AudX
+    # Transcribe results go out in utterance order (_emit_stt): with several ASR workers a later utterance can
+    # reach FINAL first, and the proto result has no utterance_id for the client to sort on.
+    stt_emit_next: int = 1  # lowest utterance whose FINAL is not handled yet
+    stt_held: dict[int, _SttHeld] = field(default_factory=dict)  # later utterances' results, held
     vad: object = field(init=False)
     pre_roll: SampleBuffer = field(init=False)
 
@@ -1549,11 +1561,12 @@ class EngineCoordinator:
             utt.source_audio.append(raw_initial)
         utt.samples += initial_audio.size
 
-        # pre_roll is at 16 kHz internal rate; convert to RTP clock ticks.
-        pre_roll_rtp_ticks = int(round(initial_audio.size * stream.rtp_clock_rate / 16_000))
-        utt.ts_start = self._rtp_add(rtp_timestamp, -pre_roll_rtp_ticks)
         rtp_ticks = int(round(source_samples * stream.rtp_clock_rate / source_rate))
         utt.ts_end = self._rtp_add(rtp_timestamp, rtp_ticks)
+        # The pre-roll already holds this chunk, so it ends where this chunk ends (ts_end), not where it starts.
+        # pre_roll is at 16 kHz internal rate; convert to RTP clock ticks.
+        pre_roll_rtp_ticks = int(round(initial_audio.size * stream.rtp_clock_rate / 16_000))
+        utt.ts_start = self._rtp_add(utt.ts_end, -pre_roll_rtp_ticks)
 
         stream.active_utterance = utt
         ACTIVE_UTTERANCES.inc()
@@ -1753,7 +1766,7 @@ class EngineCoordinator:
             stt_segmented = self._stt_segmentation_live(utt)
             if stt_segmented:
                 stt_commits = self._segment_update(stream.key, utt, result)
-                self._emit_stt_segments(stream.key, utt, stt_commits, result.confidence)
+                self._emit_stt_segments(stream, utt, stt_commits, result.confidence)
             if (text_changed or stt_commits) and (
                 utt.task == TASK_SPEECH_TO_TEXT
                 or (
@@ -1763,7 +1776,7 @@ class EngineCoordinator:
             ):
                 partial_text = self._segment_remainder(utt) if stt_segmented else result.text
                 if partial_text:
-                    self._emit_recognition(
+                    partial = dict(
                         key=stream.key,
                         utterance_id=utt.utterance_id,
                         text=partial_text,
@@ -1773,6 +1786,10 @@ class EngineCoordinator:
                         language=utt.source_language,
                         confidence=result.confidence,
                     )
+                    if utt.task == TASK_SPEECH_TO_TEXT:
+                        self._emit_stt(stream, **partial)
+                    else:  # translate source partials (translate_emit_source_partials): not ordered
+                        self._emit_recognition(**partial)
             if self.settings.segmentation_mode == "shadow":
                 self._segment_update(stream.key, utt, result)
             elif self.settings.segmentation_mode == "on" and self._segmentation_live(utt):
@@ -1843,7 +1860,9 @@ class EngineCoordinator:
                 final_text = self._segment_remainder(utt)
                 # After mid-utterance commits, a punctuation-only tail is not worth a result.
                 if utt.segments_submitted == 0 or normalize_words(final_text):
-                    self._emit_recognition(
+                    self._emit_stt(
+                        stream,
+                        last=True,
                         key=stream.key,
                         utterance_id=utt.utterance_id,
                         text=final_text,
@@ -1855,6 +1874,8 @@ class EngineCoordinator:
                         wall_start=utt.wall_start,
                         segment_idx=utt.segments_submitted if utt.segments_submitted else None,
                     )
+                else:
+                    self._stt_utterance_done(stream, utt.utterance_id)
             elif not utt.target_language:
                 await self._passthrough_utterance(
                     stream,
@@ -2123,16 +2144,51 @@ class EngineCoordinator:
             and not utt.segmenter_failed
         )
 
+    def _emit_stt(self, stream: StreamContext, *, last: bool = False, **emit) -> None:
+        """Emit a transcribe result (kwargs of _emit_recognition) in utterance order; last: the utterance's FINAL.
+
+        Results of an utterance after stream.stt_emit_next are held until the earlier ones have emitted their
+        FINAL. Of the held partials only the latest is kept: any newer result of the utterance replaces it.
+        """
+        utterance_id = emit["utterance_id"]
+        if utterance_id <= stream.stt_emit_next:
+            self._emit_recognition(**emit)
+            if last:
+                self._stt_utterance_done(stream, utterance_id)
+            return
+        held = stream.stt_held.setdefault(utterance_id, _SttHeld())
+        if held.items and not held.items[-1]["is_final"]:
+            held.items.pop()
+        held.items.append(emit)
+        held.done = held.done or last
+
+    def _stt_utterance_done(self, stream: StreamContext, utterance_id: int) -> None:
+        """The FINAL of a transcribe utterance is handled (also when it had nothing to emit): once the awaited
+        utterance is done, emit what the following ones hold, up to the first one still unfinished."""
+        if utterance_id > stream.stt_emit_next:
+            stream.stt_held.setdefault(utterance_id, _SttHeld()).done = True
+            return
+        if utterance_id < stream.stt_emit_next:
+            return
+        stream.stt_emit_next += 1
+        while (held := stream.stt_held.pop(stream.stt_emit_next, None)) is not None:
+            for emit in held.items:
+                self._emit_recognition(**emit)
+            if not held.done:
+                return
+            stream.stt_emit_next += 1
+
     def _emit_stt_segments(
-        self, key: StreamKey, utt: UtteranceContext, commits: list[SegmentCommit], confidence: float
+        self, stream: StreamContext, utt: UtteranceContext, commits: list[SegmentCommit], confidence: float
     ) -> None:
         for commit in commits:
             ts_start, ts_end = self._segment_ts(utt)
             utt.segments_submitted += 1
             self._record_committed(utt, commit.text)
             utt.segment_ts_cursor = ts_end
-            self._emit_recognition(
-                key=key,
+            self._emit_stt(
+                stream,
+                key=stream.key,
                 utterance_id=utt.utterance_id,
                 text=commit.text,
                 is_final=True,
@@ -3554,7 +3610,8 @@ class EngineCoordinator:
                     )
                     duration_ms += gap_ms
                     rtp_timestamp = expected
-                    source_samples += pcm_gap_samples
+                    # source_samples counts samples at the input rate, not the 16 kHz of `audio`
+                    source_samples += int(round(gap_ms * source_rate / 1000))
                     rtp_duration_ticks += gap_rtp_ticks
                     actual_end = self._rtp_add(rtp_timestamp, rtp_duration_ticks)
                     RTP_GAP_SILENCE_INSERTED.inc()
