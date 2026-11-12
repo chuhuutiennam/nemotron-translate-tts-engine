@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/coordinator.py`, `scripts/check_rtp_log.py`, `tests/{test_coordinator_flow,test_check_rtp_log}.py`, `docs/{system-design (5.2),scripts-guide (1.2)}.md`: RTP jitter no longer inserts silence that is not there.
+  - **Bug fixed:** `_apply_rtp_policy` accepted a chunk up to `rtp.jitter_tolerance_ms` behind `expected_rtp_timestamp` but left `expected` where it was. The next chunk, contiguous with the one just accepted, then looked like a forward gap, and with `gap_policy: insert_silence` (the shipped config) silence was inserted. Example, 20 ms chunks at an 8 kHz clock: `1000 → 1144 → 1304` gave ASR 78 ms instead of 60 ms (18 ms of false silence). The `out_of_order_policy: accept` branch had the same fault for a chunk that starts behind expected by more than the tolerance but ends past it (not used by the shipped config, which drops).
+  - **Change:** new `_advance_expected_rtp`, used by both branches: `expected` moves to the end of the accepted chunk when that end is past it, and never moves back (a repeated chunk leaves it as it was).
+  - **`check_rtp_log.py`** predicts the inserted silence the same way in its jitter branch. Its `out_of_order` branch still does not move the mark, which matches the engine with `drop`.
+  - **Tests:**
+    - `test_jitter_tolerance_accepts_small_ooo` used to lock the wrong value (`expected` 1160); it now expects 1304.
+    - New engine tests: the three-chunk case above (60 ms reach ASR), a repeated chunk within the tolerance (`expected` does not move back, no silence), and `accept` with 80 ms chunks `1000 → 1400 → 2040` (no 50 ms of false silence).
+    - New script test: a 2 ms jitter followed by a contiguous chunk gives no gap. The old jitter test now checks 10 ms (the real hole), not 20 ms.
+  - **Verified:** the three engine tests failed on the old code (1160 instead of 1304; 1248 samples instead of 960; 4640 instead of 3840) and pass now. pytest (Windows) 973 passed, 27 skipped.
+  - **Out of scope, unchanged:**
+    - The overlapping 2 ms of a jitter chunk still reach ASR.
+    - With `drop`, a timestamp that jumps back beyond the tolerance still drops every later chunk (memory note on the RTP ingest review).
+    - `last_source_rate` is written but never read.
+  - Real calls through rtpgw have contiguous timestamps, so this mostly affects senders whose timestamps drift slightly.
+
 - `src/nemotron_testbed/{runtime,pools}.py`, `tests/test_runtime_cancel.py` (new, 7 tests), `docs/system-design.md` (5.4, 5.5, 7.2, 7.3): fix ASR state leaks on CANCEL.
   - **Bugs fixed:**
     - CANCEL before START: when an RPC was cancelled while its START still waited in the worker queue, CANCEL (priority 0) ran first and found no state. The START (priority 2) then created encoder caches that nobody freed, because the RPC and the pool affinity were already gone (RPC=0, owner=0, state=1). The key holds `rpc_id`, so the state stayed until restart.

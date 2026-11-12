@@ -226,6 +226,10 @@ def analyze_stream(
                 detail = f"ts={ts} expected={expected_ts} diff={diff} ticks ({diff * 1000.0 / clock:.1f} ms)"
                 if jitter_ticks > 0 and abs(diff) <= jitter_ticks:
                     flag("jitter", index, detail + " -> accepted within jitter tolerance")
+                    # as the engine: expected moves to the end of this chunk when it is past it, never back
+                    end = (ts + dur_ticks) & _MASK
+                    if _signed_diff(end, expected_ts) > 0:
+                        expected_ts = end
                 else:
                     flag("out_of_order", index, detail + " -> engine warns (policy decides drop/process)")
 

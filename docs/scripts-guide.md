@@ -104,6 +104,10 @@ khoảng lặng giả), `gap_lost` (mất chunk), `out_of_order`, `param_change`
 chừng). Vấn đề `chunk_seq` (`seq_gap`, `seq_backwards`, `seq_constant_zero` = trường chưa được set)
 chỉ là cảnh báo `WARN`, không làm đổi mã thoát.
 
+Chunk lùi trong `--jitter-ms` được tính như engine: mốc dời lên cuối chunk nếu vượt mốc cũ, nên
+`inserted_silence_ms` chỉ gồm lỗ thật trên timeline. Với `out_of_order`, script không dời mốc, khớp engine ở
+`out_of_order_policy: drop` (cấu hình phát hành).
+
 Mã thoát: `0` không có lỗi loại trên, `1` có lỗi, `2` không phân tích được gì; thông báo cho biết lý do: sai đường dẫn, không có dòng `GRPC_IN` (cần log level DEBUG),
 có `GRPC_IN` nhưng sai định dạng (build khác), hoặc bộ lọc loại hết (kèm danh sách `session`/`stream` đang có).
 

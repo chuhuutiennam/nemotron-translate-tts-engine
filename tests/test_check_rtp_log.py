@@ -94,6 +94,17 @@ class AnalyzeTest(unittest.TestCase):
         result = check.analyze_stream(chunks)
         self.assertEqual(result["counts"].get("jitter"), 1)
         self.assertNotIn("out_of_order", result["counts"])
+        # as the engine: expected moves to the end of chunk 3 (400 + 160), so only the real 10 ms hole before
+        # chunk 4 (640) is filled, not 20 ms from the old expected (480)
+        self.assertAlmostEqual(result["inserted_silence_ms"], 10.0, delta=0.5)
+
+    def test_jitter_then_contiguous_chunk_has_no_gap(self):
+        chunks = pcmu_stream(5)
+        for later in chunks[3:]:
+            later["rtp_timestamp"] -= 16  # chunk 3 is 2 ms behind, chunk 4 contiguous with it
+        result = check.analyze_stream(chunks)
+        self.assertEqual(result["counts"], {"jitter": 1})
+        self.assertEqual(result["inserted_silence_ms"], 0.0)
 
     def test_out_of_order_beyond_jitter(self):
         chunks = pcmu_stream(5)
