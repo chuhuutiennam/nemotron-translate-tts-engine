@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/runtime.py`, `tests/test_runtime_cancel.py` (5 new tests), `docs/system-design.md` (5.5): a START waiting for queue room no longer runs after CANCEL.
+  - **Bug fixed:** a blocking `submit(timeout=…)` waits for room in `_CommandQueue.put()`, outside the heap. When the utterance was cancelled meanwhile, the worker purged the heap (the START was not in it), freed the state, released the mark and emitted CANCELLED, and the pool dropped the affinity. When room came, the producer woke up, saw no mark and queued the START, so the result was `CANCELLED` → `STARTED`, with a state left and no affinity. Reproduced with the real pool and worker. Only `NemotronRuntimePool.submit()` takes this path; the coordinator uses `submit_nowait` / `try_submit_nowait`, which never wait.
+  - **Change:**
+    - `_CommandQueue` counts producers waiting in `put()` per `(StreamKey, utterance_id)` (`_waiting`), and `request_cancel` wakes them so they drop their command.
+    - `release_cancel` now returns a bool: while a producer of the utterance still waits, it keeps the mark and returns False, and the worker does not emit CANCELLED yet. The last producer to leave hands the utterance back to the worker (`_cancel_requests`), which then releases the mark and emits CANCELLED.
+    - So CANCELLED, and with it the pool affinity release, now waits until no command of the utterance is queued, running or waiting for room.
+  - **Tests:** new `BlockingProducerCancelTest`:
+    - a START waiting for room is dropped (only CANCELLED; state, affinity and marks back to 0);
+    - several waiting commands of one utterance are all dropped;
+    - a waiting command of another utterance still runs;
+    - a producer that times out leaves no count;
+    - `_CommandQueue` alone keeps the mark while a producer waits.
+    The shared helpers moved to `CancelHarness`. On the old code, three tests timed out with the state leaked, and the `_CommandQueue` test failed (no `_waiting`); the timeout test passed (it guards the count). The file passed 10 runs in a row; pytest (Windows) 991 passed, 27 skipped.
+
 - `src/nemotron_testbed/coordinator.py`, `tests/test_coordinator_flow.py`, `docs/system-design.md` (5.2): three coordinator fixes from a review (one commit each).
   - **RTP gap with input other than 16 kHz:** the silence added for a gap is 16 kHz samples, and those were also added to `source_samples`, which counts input-rate samples and gives `ts_end`. With 8 kHz input, a 20 ms gap (1000 → 1320) gave `ts_end` 1640 instead of 1480; the tail split at VAD END used the same wrong count. The gap is now converted to the input rate. rtpgw sends 16 kHz, so production was not affected. New test `test_rtp_gap_with_8khz_input_counts_source_samples` (1640 on the old code).
   - **`ts_start` one chunk early:** the pre-roll already holds the chunk that triggers VAD START, but its length was subtracted from the start of that chunk. Every utterance's `ts_start` was one chunk early (80 ms with rtpgw chunks), and a first chunk at ts 0 gave `ts_start` = 2^32 − chunk length. `ts_start` is now `ts_end` of the START chunk minus the pre-roll length.

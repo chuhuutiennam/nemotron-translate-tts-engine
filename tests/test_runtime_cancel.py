@@ -12,9 +12,16 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from nemotron_testbed.domain import RuntimeCommand, RuntimeCommandType, RuntimeResultType, StreamKey, SubmitStatus
+from nemotron_testbed.domain import (
+    QueueFullError,
+    RuntimeCommand,
+    RuntimeCommandType,
+    RuntimeResultType,
+    StreamKey,
+    SubmitStatus,
+)
 from nemotron_testbed.pools import NemotronRuntimePool
-from nemotron_testbed.runtime import NemotronRuntime
+from nemotron_testbed.runtime import NemotronRuntime, _CommandQueue
 
 BUSY = StreamKey("rpc-busy", "call-busy", "MO")
 KEY = StreamKey("rpc", "call", "MO")
@@ -60,7 +67,9 @@ START, STEP, FINALIZE, CANCEL = (
 )
 
 
-class RuntimeCancelTest(unittest.TestCase):
+class CancelHarness(unittest.TestCase):
+    """Helpers shared by the CANCEL tests (no tests of its own)."""
+
     def make_pool(self, workers=1, queue_size=64):
         self.results = []
         pool = NemotronRuntimePool(
@@ -118,6 +127,8 @@ class RuntimeCancelTest(unittest.TestCase):
         pool.submit_nowait(command(CANCEL, BUSY))
         self.wait_result(RuntimeResultType.CANCELLED, BUSY)
 
+
+class RuntimeCancelTest(CancelHarness):
     def test_cancel_before_start_drops_the_start(self):
         pool = self.make_pool()
         runtime = self.hold_worker(pool)
@@ -269,6 +280,119 @@ class RuntimeCancelTest(unittest.TestCase):
             self.assertIn(RuntimeResultType.CANCELLED, self.types(key))
             self.assertLessEqual(self.types(key).count(RuntimeResultType.STARTED), 1)
         self.assertNotIn(RuntimeResultType.ERROR, [result.type for result in self.results])
+
+
+class BlockingProducerCancelTest(CancelHarness):
+    """submit() with a timeout can wait for room outside the command heap. A CANCEL of that utterance must drop the
+    waiting command too: before the fix the worker released the mark, then the producer woke up and queued its
+    START, which ran after CANCELLED and left a state with no affinity."""
+
+    KEY2 = StreamKey("rpc2", "call2", "MT")
+
+    def blocking_submit(self, pool, cmd, timeout=5.0):
+        outcome = {}
+
+        def run():
+            try:
+                pool.submit(cmd, timeout=timeout)
+                outcome["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - reported to the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, outcome
+
+    def wait_producers(self, runtime, key, count=1, utterance_id=1):
+        waiting = getattr(runtime._commands, "_waiting", None)
+        if waiting is None:  # code before the fix: no counter, give the producer time to block
+            time.sleep(0.1)
+            return
+        self.wait_until(lambda: waiting.get((key, utterance_id), 0) == count)
+
+    def full_queue(self):
+        """One worker busy in a model step of BUSY and its queue (size 1) full."""
+        pool = self.make_pool(queue_size=1)
+        runtime = self.hold_worker(pool)
+        self.assertIs(pool.try_submit_nowait(command(STEP, BUSY)), SubmitStatus.ACCEPTED)
+        self.assertEqual(runtime.queue_depth, 1)
+        return pool, runtime
+
+    def finish(self, pool, runtime, threads):
+        runtime.gate.set()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        pool.submit_nowait(command(CANCEL, BUSY))
+        self.wait_result(RuntimeResultType.CANCELLED, BUSY)
+        time.sleep(0.05)  # a late START would show up here
+        self.assert_clean(pool)
+        self.assertFalse(getattr(runtime._commands, "_waiting", None))
+
+    def test_cancel_drops_a_start_waiting_for_room(self):
+        pool, runtime = self.full_queue()
+        thread, outcome = self.blocking_submit(pool, command(START))
+        self.wait_producers(runtime, KEY)
+        pool.submit_nowait(command(CANCEL))
+
+        self.finish(pool, runtime, [thread])
+        self.assertEqual(outcome, {"ok": True})  # dropped, not an error
+        self.assertEqual(self.types(), [RuntimeResultType.CANCELLED])  # no STARTED after CANCELLED
+
+    def test_several_waiting_commands_of_one_utterance_are_all_dropped(self):
+        pool, runtime = self.full_queue()
+        start, _ = self.blocking_submit(pool, command(START))
+        self.wait_producers(runtime, KEY)
+        step, _ = self.blocking_submit(pool, command(STEP))
+        self.wait_producers(runtime, KEY, count=2)
+        pool.submit_nowait(command(CANCEL))
+
+        self.finish(pool, runtime, [start, step])
+        self.assertEqual(self.types(), [RuntimeResultType.CANCELLED])
+        self.assertEqual(self.steps(runtime), [])
+
+    def test_waiting_command_of_another_utterance_still_runs(self):
+        pool, runtime = self.full_queue()
+        cancelled, _ = self.blocking_submit(pool, command(START))
+        self.wait_producers(runtime, KEY)
+        other, other_outcome = self.blocking_submit(pool, command(START, self.KEY2))
+        self.wait_producers(runtime, self.KEY2)
+        pool.submit_nowait(command(CANCEL))
+
+        runtime.gate.set()
+        other.join(5)
+        self.assertEqual(other_outcome, {"ok": True})
+        self.wait_result(RuntimeResultType.STARTED, self.KEY2)
+        pool.submit_nowait(command(CANCEL, self.KEY2))
+        self.wait_result(RuntimeResultType.CANCELLED, self.KEY2)
+        self.finish(pool, runtime, [cancelled])
+        self.assertEqual(self.types(), [RuntimeResultType.CANCELLED])
+        self.assertEqual(self.types(self.KEY2), [RuntimeResultType.STARTED, RuntimeResultType.CANCELLED])
+
+    def test_producer_timing_out_leaves_no_count(self):
+        pool, runtime = self.full_queue()
+        thread, outcome = self.blocking_submit(pool, command(START), timeout=0.2)
+        thread.join(5)
+        self.assertIsInstance(outcome.get("error"), QueueFullError)
+        self.finish(pool, runtime, [])  # START never queued, affinity dropped by the pool
+        self.assertEqual(self.types(), [])
+
+    def test_mark_kept_while_a_producer_still_waits(self):
+        """_CommandQueue alone: the worker's release waits for the last waiting producer of the utterance."""
+        commands = _CommandQueue(maxsize=1)
+        state_key = (KEY, 1)
+        commands._waiting[state_key] = 1  # a producer of the utterance is blocked in put()
+        self.assertTrue(commands.request_cancel(state_key))
+        self.assertEqual(commands.get(), ([(state_key, 0)], None))
+        self.assertFalse(commands.release_cancel(state_key))  # kept: CANCELLED must wait
+        self.assertEqual(commands.pending_cancellations, 1)
+
+        with commands._lock:
+            commands._producer_left(state_key)  # it wakes up, sees the mark and drops its command
+        self.assertEqual(commands.get(), ([(state_key, 0)], None))  # handed back to the worker
+        self.assertTrue(commands.release_cancel(state_key))
+        self.assertEqual(commands.pending_cancellations, 0)
+        self.assertFalse(commands._waiting)
 
 
 if __name__ == "__main__":

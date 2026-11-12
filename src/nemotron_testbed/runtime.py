@@ -104,6 +104,9 @@ class _CommandQueue:
     A CANCEL marks its (StreamKey, utterance_id) at once, on the caller's thread, and wakes the worker even when the
     command queue is full. While marked, new commands of that utterance are refused; the worker takes the request
     before any command, drops the queued commands of the utterance, frees its state and only then releases the mark.
+
+    A blocking put() can wait for room outside the heap. Such producers are counted per utterance: a CANCEL wakes
+    them so they drop their command, and the mark is only released once none of them is left (release_cancel).
     """
 
     def __init__(self, maxsize: int) -> None:
@@ -111,6 +114,8 @@ class _CommandQueue:
         self._heap: list[_PrioritizedCommand] = []
         self._cancel_requests: dict[_StateKey, None] = {}  # not yet taken by the worker, in arrival order
         self._cancelled: set[_StateKey] = set()  # marked from request until release_cancel
+        self._waiting: Counter[_StateKey] = Counter()  # producers blocked in put(), per utterance
+        self._cleaned: set[_StateKey] = set()  # marked, state freed, waiting for those producers to leave
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)  # wakes the worker: a command or a CANCEL request
         self._not_full = threading.Condition(self._lock)
@@ -133,36 +138,67 @@ class _CommandQueue:
 
         False when its utterance is cancelled: the command is dropped, not queued.
         """
+        state_key = _state_key(item.command)
         with self._not_full:
             deadline = None if timeout is None else time.monotonic() + timeout
-            while not self._marked(item.command) and 0 < self._maxsize <= len(self._heap):
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    raise queue.Full
-                self._not_full.wait(remaining)
+            waiting = False
+            try:
+                while not self._marked(item.command) and 0 < self._maxsize <= len(self._heap):
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise queue.Full
+                    if not waiting and state_key is not None:
+                        waiting = True
+                        self._waiting[state_key] += 1
+                    self._not_full.wait(remaining)
+            finally:
+                if waiting:
+                    self._producer_left(state_key)
             if self._marked(item.command):
                 return False
             heapq.heappush(self._heap, item)
             self._not_empty.notify()
             return True
 
+    def _producer_left(self, state_key: _StateKey) -> None:
+        """A producer of the utterance stopped waiting (lock held). When it was the last one and the worker already
+        freed the state, hand the utterance back to the worker to release the mark and confirm CANCELLED."""
+        self._waiting[state_key] -= 1
+        if self._waiting[state_key] > 0:
+            return
+        del self._waiting[state_key]
+        if state_key in self._cleaned:
+            self._cleaned.discard(state_key)
+            self._cancel_requests[state_key] = None
+            self._not_empty.notify()
+
     def request_cancel(self, state_key: _StateKey) -> bool:
-        """Mark the utterance cancelled and wake the worker; False when it is already marked."""
+        """Mark the utterance cancelled and wake the worker, and the producers waiting for room so they drop their
+        command; False when it is already marked."""
         with self._lock:
             if state_key in self._cancelled:
                 return False
             self._cancelled.add(state_key)
             self._cancel_requests[state_key] = None
             self._not_empty.notify()
+            if self._waiting.get(state_key):
+                self._not_full.notify_all()
             return True
 
     def is_cancelled(self, state_key: _StateKey) -> bool:
         with self._lock:
             return state_key in self._cancelled
 
-    def release_cancel(self, state_key: _StateKey) -> None:
+    def release_cancel(self, state_key: _StateKey) -> bool:
+        """After the worker freed the state: release the mark (True). While a producer of the utterance still waits
+        in put(), keep it so that producer drops its command, and return False: the last one to leave hands the
+        utterance back to the worker (get), which calls this again."""
         with self._lock:
+            if self._waiting.get(state_key):
+                self._cleaned.add(state_key)
+                return False
             self._cancelled.discard(state_key)
+            return True
 
     def get(self) -> tuple[list[tuple[_StateKey, int]], _PrioritizedCommand | None]:
         """Wait for work. CANCEL requests come first, with their queued commands dropped:
@@ -423,16 +459,17 @@ class NemotronRuntime:
 
     def _finish_cancel(self, state_key: _StateKey, dropped: int) -> None:
         """Free the state of a cancelled utterance (its queued commands are already dropped), release the mark,
-        then confirm CANCELLED: the pool frees the affinity on it."""
+        then confirm CANCELLED: the pool frees the affinity on it. While a producer of the utterance still waits for
+        room in put(), the mark stays and CANCELLED waits: the queue hands the utterance back here once it left."""
         started = time.perf_counter()
         key, utterance_id = state_key
         freed = self._states.pop(state_key, None) is not None
-        self._commands.release_cancel(state_key)
+        released = self._commands.release_cancel(state_key)
         MODEL_STEP_SECONDS.labels(command=RuntimeCommandType.CANCEL.name).observe(time.perf_counter() - started)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "ASR utterance cancelled: worker=%s rpc=%s session=%s stream=%s utterance=%s "
-                "state_freed=%s dropped_commands=%s",
+                "state_freed=%s dropped_commands=%s released=%s",
                 self.worker_id,
                 key.rpc_id,
                 key.session_id,
@@ -440,8 +477,10 @@ class NemotronRuntime:
                 utterance_id,
                 freed,
                 dropped,
+                released,
             )
-        self._emit(RuntimeResult(type=RuntimeResultType.CANCELLED, key=key, utterance_id=utterance_id))
+        if released:
+            self._emit(RuntimeResult(type=RuntimeResultType.CANCELLED, key=key, utterance_id=utterance_id))
 
     def _load_model(self) -> None:
         import torch
