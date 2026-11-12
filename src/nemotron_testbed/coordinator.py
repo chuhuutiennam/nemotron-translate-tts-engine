@@ -3554,7 +3554,8 @@ class EngineCoordinator:
                     )
                     duration_ms += gap_ms
                     rtp_timestamp = expected
-                    source_samples += pcm_gap_samples
+                    # source_samples counts samples at the input rate, not the 16 kHz of `audio`
+                    source_samples += int(round(gap_ms * source_rate / 1000))
                     rtp_duration_ticks += gap_rtp_ticks
                     actual_end = self._rtp_add(rtp_timestamp, rtp_duration_ticks)
                     RTP_GAP_SILENCE_INSERTED.inc()

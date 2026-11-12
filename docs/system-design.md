@@ -175,7 +175,7 @@ Chức năng:
 - **Tiếp nhận chunk** (`accept_chunk`): kiểm tra tham số, so `duration_ms` khai báo với payload thực, giải mã và resample về 16 kHz.
 - **Quản lý stream:** mở stream mới, kiểm tra `task`, `sample_rate`, `channels`, `language`, `rtp_clock_rate` không đổi trong một stream.
 - **Liên tục RTP:** `_validate_chunk_seq` (chỉ cảnh báo) và `_apply_rtp_policy`:
-  - Gap tiến: `gap_policy: insert_silence` và gap ≤ `max_gap_ms` thì chèn silence; gap lớn hơn hoặc `gap_policy: warn` thì chỉ cảnh báo, không chèn (mất audio); `gap_policy: error` ném `DataLossError` (`DATA_LOSS`).
+  - Gap tiến: `gap_policy: insert_silence` và gap ≤ `max_gap_ms` thì chèn silence; gap lớn hơn hoặc `gap_policy: warn` thì chỉ cảnh báo, không chèn (mất audio); `gap_policy: error` ném `DataLossError` (`DATA_LOSS`). Silence được nối vào audio 16 kHz, còn `source_samples` (dùng để tính `ts_end`) cộng phần gap theo sample rate của input. Trước bản sửa, phần này cộng số mẫu 16 kHz, nên với input 8 kHz, gap 20 ms (1000 → 1320) cho `ts_end` 1640 thay vì 1480.
   - Timestamp lùi trong `jitter_tolerance_ms` (20 ms) thì chấp nhận; quá dung sai thì theo `out_of_order_policy`: `drop` bỏ chunk, `error` ném `DataLossError`, `accept` cho đi tiếp.
   - Chunk lùi được nhận (jitter hoặc `accept`) dời mốc `expected_rtp_timestamp` lên cuối chunk nếu cuối chunk vượt mốc cũ, không bao giờ dời lùi (`_advance_expected_rtp`). Nhờ vậy chunk sau, nếu liền với chunk này, không bị coi là gap. Trước bản sửa, mốc giữ nguyên nên chuỗi `1000 → 1144 → 1304` (20 ms, clock 8 kHz) bị chèn 18 ms silence giả (ASR nhận 78 ms thay vì 60 ms).
 - **Phân đoạn bằng VAD:** `_process_audio`, `_start_utterance`; tách phần đuôi sau khi VAD kết thúc để audio kế tiếp đi vào utterance mới mà không chờ FINAL.

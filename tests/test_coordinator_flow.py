@@ -1707,6 +1707,32 @@ class RtpClockRateTest(unittest.IsolatedAsyncioTestCase):
         # Without fix:  320 + 160 (silence) + 320 = 800
         self.assertEqual(stream.active_utterance.model_audio.samples, 960)
 
+    async def test_rtp_gap_with_8khz_input_counts_source_samples(self):
+        """8 kHz input, 20 ms chunks, 1000 then 1320 (1160 missing, 20 ms gap): the chunk at 1320 ends at 1480.
+
+        The silence added to the 16 kHz audio is 320 samples, but source_samples counts 8 kHz samples, so the gap
+        adds 160 there. Before the fix it added 320, and ts_end came out 1640.
+        """
+        coordinator = self._coordinator(rtp_gap_policy="insert_silence", rtp_max_gap_ms=200)
+        rpc = coordinator.open_rpc()
+
+        def chunk_8k(ts):
+            return SimpleNamespace(
+                session_id="s1", stream_id="A",
+                pcm=np.zeros(160, dtype="<i2").tobytes(),
+                sample_rate=8000, channels=1,
+                rtp_timestamp=ts, rtp_clock_rate=8000, chunk_seq=-1,
+                duration_ms=20, end_of_stream=False, language="vi", task="transcribe",
+            )
+
+        await coordinator.accept_chunk(rpc.rpc_id, chunk_8k(1000))
+        await coordinator.accept_chunk(rpc.rpc_id, chunk_8k(1320))
+
+        self.assertFalse(rpc.cancelled)
+        utt = coordinator._streams[self._key(rpc)].active_utterance
+        self.assertEqual(utt.model_audio.samples, 960)  # 16 kHz: chunk + 20 ms silence + chunk
+        self.assertEqual(utt.ts_end, 1480)
+
     async def test_rtp_gap_100ms_chunk_800_tick_gap(self):
         """User's example: chunk_seq 100→101→102 at 8 kHz RTP clock.
 

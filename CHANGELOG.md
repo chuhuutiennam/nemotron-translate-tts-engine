@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `src/nemotron_testbed/coordinator.py`, `tests/test_coordinator_flow.py`, `docs/system-design.md` (5.2): three coordinator fixes from a review.
+  - **RTP gap with input other than 16 kHz:** the silence added for a gap is 16 kHz samples, and those were also added to `source_samples`, which counts input-rate samples and gives `ts_end`. With 8 kHz input, a 20 ms gap (1000 → 1320) gave `ts_end` 1640 instead of 1480; the tail split at VAD END used the same wrong count. The gap is now converted to the input rate. rtpgw sends 16 kHz, so production was not affected. New test `test_rtp_gap_with_8khz_input_counts_source_samples` (1640 on the old code).
+
 - `src/nemotron_testbed/coordinator.py`, `scripts/check_rtp_log.py`, `tests/{test_coordinator_flow,test_check_rtp_log}.py`, `docs/{system-design (5.2),scripts-guide (1.2)}.md`: RTP jitter no longer inserts silence that is not there.
   - **Bug fixed:** `_apply_rtp_policy` accepted a chunk up to `rtp.jitter_tolerance_ms` behind `expected_rtp_timestamp` but left `expected` where it was. The next chunk, contiguous with the one just accepted, then looked like a forward gap, and with `gap_policy: insert_silence` (the shipped config) silence was inserted. Example, 20 ms chunks at an 8 kHz clock: `1000 → 1144 → 1304` gave ASR 78 ms instead of 60 ms (18 ms of false silence). The `out_of_order_policy: accept` branch had the same fault for a chunk that starts behind expected by more than the tolerance but ends past it (not used by the shipped config, which drops).
   - **Change:** new `_advance_expected_rtp`, used by both branches: `expected` moves to the end of the accepted chunk when that end is past it, and never moves back (a repeated chunk leaves it as it was).
