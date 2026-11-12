@@ -177,6 +177,7 @@ Chức năng:
 - **Liên tục RTP:** `_validate_chunk_seq` (chỉ cảnh báo) và `_apply_rtp_policy`:
   - Gap tiến: `gap_policy: insert_silence` và gap ≤ `max_gap_ms` thì chèn silence; gap lớn hơn hoặc `gap_policy: warn` thì chỉ cảnh báo, không chèn (mất audio); `gap_policy: error` ném `DataLossError` (`DATA_LOSS`).
   - Timestamp lùi trong `jitter_tolerance_ms` (20 ms) thì chấp nhận; quá dung sai thì theo `out_of_order_policy`: `drop` bỏ chunk, `error` ném `DataLossError`, `accept` cho đi tiếp.
+  - Chunk lùi được nhận (jitter hoặc `accept`) dời mốc `expected_rtp_timestamp` lên cuối chunk nếu cuối chunk vượt mốc cũ, không bao giờ dời lùi (`_advance_expected_rtp`). Nhờ vậy chunk sau, nếu liền với chunk này, không bị coi là gap. Trước bản sửa, mốc giữ nguyên nên chuỗi `1000 → 1144 → 1304` (20 ms, clock 8 kHz) bị chèn 18 ms silence giả (ASR nhận 78 ms thay vì 60 ms).
 - **Phân đoạn bằng VAD:** `_process_audio`, `_start_utterance`; tách phần đuôi sau khi VAD kết thúc để audio kế tiếp đi vào utterance mới mà không chờ FINAL.
 - **Điều phối ASR:** `_maybe_schedule_utterance` giữ tối đa một lệnh ASR đang bay cho mỗi utterance; gửi `STEP` đúng một chunk model, `FINALIZE` kèm phần còn lại.
 - **Xử lý kết quả ASR:** partial, final, phân giải ngôn ngữ auto (`_resolve_auto_language`), segmentation.

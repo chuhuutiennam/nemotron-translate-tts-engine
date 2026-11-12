@@ -3596,9 +3596,7 @@ class EngineCoordinator:
                     },
                 )
             stream.last_rtp_timestamp = rtp_timestamp
-            # Don't advance expected_rtp_timestamp: packet arrived behind expected
-            # by jitter_ticks or less. Advancing it backward would cause the gap
-            # detector to insert silence for audio that was already expected.
+            self._advance_expected_rtp(stream, actual_end)
             return audio, rtp_timestamp, source_samples, duration_ms
 
         RTP_OUT_OF_ORDER.inc()
@@ -3618,8 +3616,16 @@ class EngineCoordinator:
             return None
 
         stream.last_rtp_timestamp = rtp_timestamp
-        # expected_rtp_timestamp intentionally not updated: the OOO chunk timestamp
-        # is behind the current expected position; resetting it would make the next
-        # in-order chunk appear as a forward gap and insert spurious silence.
+        self._advance_expected_rtp(stream, actual_end)
         stream.last_source_rate = source_rate
         return audio, rtp_timestamp, source_samples, duration_ms
+
+    def _advance_expected_rtp(self, stream: StreamContext, chunk_end: int) -> None:
+        """A chunk that started behind expected_rtp_timestamp (jitter, or OOO accepted): move expected to the end
+        of the audio received so far, i.e. to chunk_end when it is past expected, never backward.
+
+        Kept where it was, the next chunk (contiguous with this one) would look like a forward gap and get
+        silence that is not there; moved back, audio already received would be counted as a gap again.
+        """
+        if self._rtp_diff(chunk_end, stream.expected_rtp_timestamp) > 0:
+            stream.expected_rtp_timestamp = chunk_end

@@ -1798,8 +1798,8 @@ class RtpClockRateTest(unittest.IsolatedAsyncioTestCase):
         Scenario: chunk 1 ts=1000 (expected_next=1160). Chunk 2 arrives at ts=1144,
         which is 16 ticks behind expected (= 2 ms at 8 kHz) — within the 20 ms
         tolerance (20 ms × 8 kHz / 1000 = 160 ticks). Must be accepted, and
-        expected_rtp_timestamp must stay at 1160 so the next in-order chunk is not
-        misread as a forward gap.
+        expected_rtp_timestamp moves to the end of chunk 2 (1144 + 160 = 1304),
+        so the next chunk, contiguous with it, is not misread as a forward gap.
         """
         coordinator = self._coordinator(rtp_jitter_tolerance_ms=20)
         rpc = coordinator.open_rpc()
@@ -1809,8 +1809,70 @@ class RtpClockRateTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(rpc.cancelled)
         stream = coordinator._streams[self._key(rpc)]
-        self.assertEqual(stream.expected_rtp_timestamp, 1160)
+        self.assertEqual(stream.expected_rtp_timestamp, 1304)
         self.assertEqual(stream.last_rtp_timestamp, 1144)
+
+    async def test_jitter_chunk_then_contiguous_chunk_inserts_no_silence(self):
+        """1000 -> 1144 (2 ms behind, within jitter) -> 1304 (contiguous with chunk 2): 60 ms reach ASR.
+
+        Before the fix expected stayed 1160, so 1304 looked like an 18 ms gap and 18 ms of
+        silence were inserted (78 ms in total).
+        """
+        coordinator = self._coordinator(rtp_jitter_tolerance_ms=20, rtp_gap_policy="insert_silence")
+        rpc = coordinator.open_rpc()
+
+        for ts in (1000, 1144, 1304):
+            await coordinator.accept_chunk(rpc.rpc_id, self._chunk(ts))
+
+        self.assertFalse(rpc.cancelled)
+        stream = coordinator._streams[self._key(rpc)]
+        self.assertEqual(stream.active_utterance.model_audio.samples, 3 * 320)
+        self.assertEqual(stream.expected_rtp_timestamp, 1464)
+
+    async def test_duplicate_within_jitter_does_not_move_expected_back(self):
+        """A repeated chunk (its end is not past expected) leaves expected where it was."""
+        coordinator = self._coordinator(rtp_jitter_tolerance_ms=20, rtp_gap_policy="insert_silence")
+        rpc = coordinator.open_rpc()
+
+        await coordinator.accept_chunk(rpc.rpc_id, self._chunk(1000))
+        await coordinator.accept_chunk(rpc.rpc_id, self._chunk(1160))
+        await coordinator.accept_chunk(rpc.rpc_id, self._chunk(1160))  # repeated: accepted as jitter
+        stream = coordinator._streams[self._key(rpc)]
+        self.assertEqual(stream.expected_rtp_timestamp, 1320)
+        await coordinator.accept_chunk(rpc.rpc_id, self._chunk(1320))
+
+        self.assertFalse(rpc.cancelled)
+        self.assertEqual(stream.active_utterance.model_audio.samples, 4 * 320)  # no silence inserted
+        self.assertEqual(stream.expected_rtp_timestamp, 1480)
+
+    async def test_ooo_accept_chunk_past_expected_moves_expected(self):
+        """out_of_order_policy=accept, 80 ms chunks (640 ticks): 1000 -> 1400 -> 2040.
+
+        1400 is 240 ticks (30 ms) behind expected 1640, beyond the 20 ms jitter tolerance, so it
+        goes to the accept branch; it ends at 2040, past 1640, so 2040 is contiguous. Before the
+        fix expected stayed 1640 and 50 ms of silence (800 samples) were inserted before 2040.
+        """
+        coordinator = self._coordinator(
+            rtp_jitter_tolerance_ms=20, rtp_gap_policy="insert_silence", rtp_out_of_order_policy="accept"
+        )
+        rpc = coordinator.open_rpc()
+
+        def chunk_80ms(ts):
+            return SimpleNamespace(
+                session_id="s1", stream_id="A",
+                pcm=np.zeros(1280, dtype="<i2").tobytes(),
+                sample_rate=16000, channels=1,
+                rtp_timestamp=ts, rtp_clock_rate=8000, chunk_seq=-1,
+                duration_ms=80, end_of_stream=False, language="vi", task="transcribe",
+            )
+
+        for ts in (1000, 1400, 2040):
+            await coordinator.accept_chunk(rpc.rpc_id, chunk_80ms(ts))
+
+        self.assertFalse(rpc.cancelled)
+        stream = coordinator._streams[self._key(rpc)]
+        self.assertEqual(stream.active_utterance.model_audio.samples, 3 * 1280)
+        self.assertEqual(stream.expected_rtp_timestamp, 2680)
 
     async def test_jitter_tolerance_drops_large_ooo(self):
         """Chunk arriving beyond jitter tolerance is still dropped (OOO policy=drop)."""
