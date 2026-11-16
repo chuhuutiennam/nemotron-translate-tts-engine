@@ -149,6 +149,16 @@ data:
   AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS: "10"  # < AUDX_COMPUTE_BUDGET_MS
   AUDIO_PREPROCESSING_AUDX_COMPUTE_BUDGET_MS: "100"  # D = 80 + 64 + 100 = 244 ms
 
+  # ── Keyword / topic detection (task=keyword) ───────────────────────
+  # Bật trên server keyword. Topics (KEYWORD_TOPICS_JSON) bắt buộc khi bật;
+  # label = TopicLabel trong proto (WEATHER | FOOD).
+  KEYWORD_ENABLED: "false"
+  KEYWORD_MODEL_PATH: /app/models/multilingual-e5-small
+  KEYWORD_DEVICE: cpu
+  KEYWORD_THRESHOLD: "0.75"
+  KEYWORD_QUEUE_SIZE: "64"
+  # KEYWORD_TOPICS_JSON: '{"WEATHER": {"rain": ["hôm nay trời mưa to quá"]}, "FOOD": {"dish": ["tôi muốn ăn phở"]}}'
+
   # ── EnViT5 Translation  (CPU) ─────────────────────────────────────
   TRANSLATION_ENABLED: "true"
   TRANSLATION_MODEL_PATH: /app/models/envit5_ctranslate2

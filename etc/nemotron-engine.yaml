@@ -179,6 +179,41 @@ audio_preprocessing:
       crossfade_ms: 10                   # AUDIO_PREPROCESSING_AUDX_CROSSFADE_MS  (chuyển raw <-> enhanced; < compute_budget_ms)
       compute_budget_ms: 100             # AUDIO_PREPROCESSING_AUDX_COMPUTE_BUDGET_MS  (0 = 100; 100 -> D = 80 + 64 + 100 = 244 ms; chưa đo GPU)
 
+# ── Keyword / topic detection (task=keyword) ─────────────────────────────────
+# Client gửi AudioChunk.task="keyword": ASR như transcribe (partial không có topic), FINAL được giữ lại
+# đến khi multilingual E5 phân loại xong text → RecognitionResult.topic_label / topic_score / topic_info.
+# Model: thư mục HF local (config.json, tokenizer, model.safetensors) của intfloat/multilingual-e5-small,
+# load bằng transformers AutoModel (local_files_only). Tắt mặc định: bật trên server keyword.
+keyword:
+  enabled: false                         # KEYWORD_ENABLED
+  model_path: models/multilingual-e5-small  # KEYWORD_MODEL_PATH
+  device: cpu                            # KEYWORD_DEVICE  (cpu | cuda | cuda:N; e5-small ~0.5 GB VRAM)
+  threshold: 0.75                        # KEYWORD_THRESHOLD  cosine < threshold → TOPIC_UNKNOWN (tune theo data thật)
+  queue_size: 64                         # KEYWORD_QUEUE_SIZE  (đầy → FINAL ra luôn với TOPIC_UNKNOWN)
+  # Label = tên trong enum TopicLabel (proto/speech.proto + domain.TopicLabel): WEATHER | FOOD.
+  # Dạng 1: LABEL: [câu mẫu]               → topic_info = ""
+  # Dạng 2: LABEL: {topic_info: [câu mẫu]} → mỗi topic_info một centroid riêng
+  # Env thay thế (khi key này không có trong file): KEYWORD_TOPICS_JSON='{"WEATHER": {"rain": ["..."]}}'
+  topics:
+    WEATHER:
+      rain:
+        - "hôm nay trời mưa to quá"
+        - "chiều nay có mưa không"
+        - "is it going to rain today"
+      temperature:
+        - "hôm nay nhiệt độ bao nhiêu độ"
+        - "trời nóng quá"
+        - "what is the temperature outside"
+    FOOD:
+      restaurant:
+        - "gần đây có quán ăn nào ngon không"
+        - "tôi muốn đặt bàn ăn tối"
+        - "recommend a good restaurant nearby"
+      dish:
+        - "món phở bò nấu thế nào"
+        - "tôi muốn ăn bún chả"
+        - "how do I cook fried rice"
+
 # ── Translation — GPU 1 ───────────────────────────────────────────────────────
 translation:
   enabled: true                          # TRANSLATION_ENABLED

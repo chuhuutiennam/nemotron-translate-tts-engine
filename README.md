@@ -2,10 +2,11 @@
 
 Production-oriented testbed for the bidirectional gRPC contract in `proto/speech.proto`.
 
-The engine supports two tasks per logical stream:
+The engine supports three tasks per logical stream:
 
 - `task=transcribe`: Nemotron streaming ASR -> partial/final text.
 - `task=translate`: Nemotron streaming ASR -> final EnViT5 translation -> Piper TTS -> raw G.711 payload.
+- `task=keyword`: Nemotron streaming ASR -> partial text; final text + topic from a multilingual E5 embedding model (`keyword.enabled`).
 
 ## Documentation
 
@@ -29,6 +30,16 @@ The engine supports two tasks per logical stream:
 
 `RecognitionResult.text` is the source-language transcript. Partial and final results are emitted. `audio_payload` is empty.
 `RecognitionResult.confidence` is the ASR utterance confidence in `[0,1]`. The runtime prefers native NeMo token/word/non-blank-frame confidence and otherwise uses a length-normalized RNNT hypothesis-score fallback.
+
+### `task=keyword`
+
+Same ASR and language semantics as `task=transcribe` (`language` = source, empty = auto; `language_source` honoured the same way). Partials are emitted as for transcribe, without a topic. The FINAL of an utterance waits until `KeywordRuntime` has classified its ASR-final text, then carries:
+
+- `topic_label`: `TopicLabel` (`TOPIC_WEATHER`, `TOPIC_FOOD`, or `TOPIC_UNKNOWN` when the best cosine score is below `keyword.threshold`).
+- `topic_score`: cosine similarity between the `query:` embedding of the text and the best topic centroid (mean of the `passage:` embeddings of its example sentences).
+- `topic_info`: the sub-topic key of the best centroid (`keyword.topics.<LABEL>.<topic_info>`), `""` for a plain list.
+
+FINALs go out in utterance order (like transcribe). An empty ASR FINAL is not classified and not emitted. When detection fails or the keyword queue is full, the FINAL is emitted with `TOPIC_UNKNOWN` (`keyword_errors_total`); the RPC is not failed. Requires `keyword.enabled: true`, `keyword.model_path` (local HF directory of `intfloat/multilingual-e5-small`) and `keyword.topics`; otherwise a `task=keyword` stream fails with gRPC `FAILED_PRECONDITION`. A new label needs `proto/speech.proto` `TopicLabel` and `domain.TopicLabel` (same numbers) plus a regenerated `pb/`.
 
 ### `task=translate`
 
@@ -433,6 +444,17 @@ PYTHONPATH=src python scripts/client_wav.py sample_vi.wav \
   --task transcribe
 ```
 
+## Test keyword (topic detection)
+
+```bash
+PYTHONPATH=src python scripts/client_wav.py sample_vi.wav \
+  --address 127.0.0.1:50052 \
+  --language vi \
+  --task keyword
+# or the minimal client kept from the keyword branch:
+python test_keyword_client.py sample_vi.wav --server 127.0.0.1:50052 --language vi-VN
+```
+
 ## Test translate + TTS
 
 Vietnamese -> English (`--language` is the target):
@@ -555,6 +577,16 @@ line per segment, just before its first `EMIT`.
 If Nemotron cannot keep up with realtime audio, increasing `MAX_INGRESS_AUDIO_MS` only delays failure. Capacity must be increased or concurrency limited.
 
 If Translation/TTS cannot keep up, `MAX_POSTPROCESS_PENDING_PER_RPC` bounds how far translated speech can lag behind the conversation.
+
+Keyword / topic metrics (`task=keyword`):
+
+```text
+keyword_jobs_total
+keyword_errors_total            # FINAL emitted with TOPIC_UNKNOWN because detection failed / queue full
+keyword_topics_total{topic="WEATHER|FOOD|UNKNOWN"}
+keyword_latency_ms              # embedding + cosine per utterance
+keyword_queue_wait_ms
+```
 
 ## Tests
 

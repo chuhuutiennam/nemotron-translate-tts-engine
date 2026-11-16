@@ -50,6 +50,10 @@ def configure_gpu_memory(settings: Settings) -> None:
             parts = device_str.split(":")
             device_indices.add(int(parts[1]) if len(parts) > 1 else 0)
 
+    if settings.keyword_enabled and settings.keyword_device.startswith("cuda"):
+        parts = settings.keyword_device.split(":")
+        device_indices.add(int(parts[1]) if len(parts) > 1 else 0)
+
     if settings.translation_enabled:
         for device_str in settings.translation_devices:
             if device_str.startswith("cuda"):
@@ -155,11 +159,12 @@ async def serve() -> None:
         await server.start()
         logger.info(
             "gRPC server ready on %s; model_chunk_ms=%s device=%s "
-            "asr_workers=%s translate=%s translation_workers=%s tts=%s tts_workers=%s",
+            "asr_workers=%s keyword=%s translate=%s translation_workers=%s tts=%s tts_workers=%s",
             settings.grpc_address,
             settings.model_chunk_ms,
             settings.device,
             settings.asr_workers,
+            settings.keyword_enabled,
             settings.translation_enabled,
             settings.translation_workers if settings.translation_enabled else 0,
             settings.tts_enabled,
