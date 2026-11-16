@@ -205,6 +205,7 @@ class SpeechStreamService(speech_pb2_grpc.SpeechStreamServicer):
                         "confidence=%.4f language=%s "
                         "text=%s "
                         "audio_bytes=%s audio_pt=%s "
+                        "topic_label=%s topic_info=%s topic_score=%.4f "
                         "buffer_wait_ms=%.1f",
                         rpc.rpc_id,
                         item.session_id,
@@ -218,6 +219,9 @@ class SpeechStreamService(speech_pb2_grpc.SpeechStreamServicer):
                         item.text,
                         len(item.audio_payload),
                         item.audio_pt,
+                        item.topic_label,
+                        item.topic_info,
+                        item.topic_score,
                         buffer_wait_ms,
                     )
 
@@ -234,6 +238,9 @@ class SpeechStreamService(speech_pb2_grpc.SpeechStreamServicer):
                     seq=item.seq,
                     audio_payload=item.audio_payload,
                     audio_pt=item.audio_pt,
+                    topic_label=int(item.topic_label),
+                    topic_score=item.topic_score,
+                    topic_info=item.topic_info,
                 )
                 # The generator resumes only after grpc finished writing the message, so
                 # this approximates the time the transport took to accept it (a slow

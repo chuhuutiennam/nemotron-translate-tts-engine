@@ -16,10 +16,18 @@ message AudioChunk {
   int64  duration_ms    = 7;
   bool   end_of_stream  = 8;
   string language       = 9; // transcribe: source language (empty = auto). translate: TARGET language (vi|en); the source is detected
-  string task           = 10; // transcribe | translate
+  string task           = 10; // transcribe | translate | keyword
   uint32 rtp_clock_rate = 11; // RTP clock Hz (e.g. 8000 for G.711, 0 = infer from sample_rate)
   int64  chunk_seq      = 12; // monotonic transport sequence number (0-based); -1 = not provided
   string language_source = 13; // SOURCE language hint (vi|en); empty = not provided. Used only when asr.use_language_source is on; it overrides `language` for transcribe and fixes the ASR source for translate (empty = auto)
+}
+
+// Topic detected on the ASR-final text of a keyword utterance (task = keyword).
+// Numerically aligned with nemotron_testbed.domain.TopicLabel.
+enum TopicLabel {
+  TOPIC_UNKNOWN = 0; // no topic above keyword.threshold, or not a keyword result
+  TOPIC_WEATHER = 1;
+  TOPIC_FOOD    = 2;
 }
 
 message RecognitionResult {
@@ -34,4 +42,7 @@ message RecognitionResult {
   uint64 seq            = 9;
   bytes  audio_payload  = 10; // G.711 payload bytes; gateway packetizes RTP
   uint32 audio_pt       = 11; // 0=PCMU, 8=PCMA
+  TopicLabel topic_label = 12; // task=keyword, FINAL only: detected topic (TOPIC_UNKNOWN otherwise)
+  float  topic_score    = 13; // task=keyword, FINAL only: cosine similarity of the best topic (0 otherwise)
+  string topic_info     = 14; // task=keyword, FINAL only: sub-topic key of the best match ("" otherwise)
 }

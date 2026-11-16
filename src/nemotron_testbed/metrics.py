@@ -100,6 +100,24 @@ TRANSLATION_LATENCY = Histogram(
     "EnViT5 final-utterance translation latency",
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
 )
+KEYWORD_JOBS = Counter("keyword_jobs_total", "Keyword/topic detection jobs accepted (task=keyword)")
+KEYWORD_ERRORS = Counter(
+    "keyword_errors_total",
+    "Keyword utterances emitted without a topic (TOPIC_UNKNOWN) because detection failed or its queue was full",
+)
+KEYWORD_TOPICS = Counter(
+    "keyword_topics_total", "Keyword FINAL results by detected topic", ["topic"]
+)
+KEYWORD_LATENCY_MS = Histogram(
+    "keyword_latency_ms",
+    "Keyword/topic detection time per utterance (embedding + cosine), queue wait excluded",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000),
+)
+KEYWORD_QUEUE_WAIT_MS = Histogram(
+    "keyword_queue_wait_ms",
+    "Time a keyword job waits in the runtime queue before detection begins",
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500),
+)
 TRANSLATION_JOBS = Counter("translation_jobs_total", "Translation jobs accepted")
 TRANSLATION_ERRORS = Counter("translation_errors_total", "Translation job failures")
 TRANSLATION_QUEUE_WAIT_MS = Histogram(

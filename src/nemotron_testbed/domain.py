@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum, IntEnum, auto
 from typing import Any
 
 import numpy as np
@@ -20,6 +20,13 @@ class SubmitStatus(Enum):
     ACCEPTED = auto()
     OVERLOADED = auto()
     UNAVAILABLE = auto()
+
+
+class TopicLabel(IntEnum):
+    """Internal enum kept numerically aligned with speech.TopicLabel (proto/speech.proto)."""
+    UNKNOWN = 0
+    WEATHER = 1
+    FOOD = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +80,38 @@ class RuntimeResult:
     detected_language: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     created: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(frozen=True, slots=True)
+class KeywordJob:
+    """ASR-final text of one task=keyword utterance, sent to KeywordRuntime for topic detection."""
+    key: StreamKey
+    utterance_id: int
+    source_text: str
+    source_language: str
+    ts_start: int
+    ts_end: int
+    asr_confidence: float = 0.0
+    wall_start: float = 0.0
+    enqueue_time: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(frozen=True, slots=True)
+class KeywordResult:
+    key: StreamKey
+    utterance_id: int
+    source_text: str
+    source_language: str
+    ts_start: int
+    ts_end: int
+    asr_confidence: float = 0.0
+    topic_label: TopicLabel = TopicLabel.UNKNOWN
+    topic_info: str = ""
+    topic_score: float = 0.0
+    wall_start: float = 0.0
+    latency_ms: float = 0.0
+    queue_ms: float = 0.0
+    error: str = ""
 
 
 @dataclass(frozen=True, slots=True)

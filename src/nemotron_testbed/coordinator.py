@@ -23,6 +23,9 @@ from .buffers import SampleBuffer
 from .config import Settings
 from .domain import (
     AudioPreprocessResult,
+    KeywordJob,
+    KeywordResult,
+    TopicLabel,
     RuntimeCommand,
     RuntimeCommandType,
     RuntimeResult,
@@ -67,6 +70,11 @@ from .metrics import (
     INGRESS_BACKLOG_MS,
     INGRESS_CHUNKS,
     INGRESS_PEAK,
+    KEYWORD_ERRORS,
+    KEYWORD_JOBS,
+    KEYWORD_LATENCY_MS,
+    KEYWORD_QUEUE_WAIT_MS,
+    KEYWORD_TOPICS,
     PARTIAL_RESULTS,
     PASSTHROUGH_TOTAL,
     PIPELINE_DEGRADED,
@@ -109,11 +117,13 @@ from .segmenter import (
     remainder_after,
 )
 from .tasks import (
+    TASK_KEYWORD,
     TASK_REALTIME_TRANSLATION,
     TASK_SPEECH_TO_TEXT,
     normalize_task,
 )
 from .trace_pcap import PcapTracer, StreamTrace
+from .keyword_runtime import KeywordRuntime
 from .pools import NemotronRuntimePool, TranslationRuntimePool, TtsRuntimePool, MagpieTtsRuntimePool
 from .vad import VadEvent, build_vad_controller, warmup_silero_cache
 
@@ -169,6 +179,9 @@ class RecognitionEnvelope:
     utterance_id: int
     audio_payload: bytes = b""
     audio_pt: int = 0
+    topic_label: int = 0  # task=keyword FINAL: domain.TopicLabel value (proto speech.TopicLabel)
+    topic_info: str = ""
+    topic_score: float = 0.0
     created: float = field(default_factory=time.monotonic)
     speech_end_wall: float = 0.0  # estimated end of speech (monotonic); 0 = unknown
     preproc_delay_s: float = 0.0  # audio_preprocessing delay D that speech_end_wall does not include; 0 = no preprocessor
@@ -502,8 +515,9 @@ class PipelineOrderState:
 class EngineCoordinator:
     """Single asyncio owner of RPC/stream lifecycle state.
 
-    Three model stages run independently:
+    Model stages run independently:
       * NemotronRuntimePool: stateful ASR workers with stream affinity
+      * KeywordRuntime: semantic topic detection on ASR-final text (task=keyword)
       * TranslationRuntimePool: stateless EnViT5 workers
       * TtsRuntimePool: Piper workers with private voice instances
 
@@ -519,6 +533,7 @@ class EngineCoordinator:
         self._runtime_results: asyncio.Queue[RuntimeResult] = asyncio.Queue(maxsize=settings.result_queue_maxsize)
         self._translation_results: asyncio.Queue[TranslationResult] = asyncio.Queue(maxsize=settings.result_queue_maxsize)
         self._tts_results: asyncio.Queue[TtsResult] = asyncio.Queue(maxsize=settings.result_queue_maxsize)
+        self._keyword_results: asyncio.Queue[KeywordResult] = asyncio.Queue(maxsize=settings.result_queue_maxsize)
         self._dispatcher_tasks: list[asyncio.Task[None]] = []
         self._rpcs: dict[str, RpcContext] = {}
         self._streams: dict[StreamKey, StreamContext] = {}
@@ -529,6 +544,9 @@ class EngineCoordinator:
         self._finishing: dict[StreamKey, dict[int, UtteranceContext]] = {}
         self._stream_seq: dict[StreamKey, int] = {}
         self._active_utterances_count: int = 0
+        # task=keyword utterances in topic detection -> their stream. The stream object is kept so the FINAL goes
+        # out through _emit_stt (utterance order) even when the stream closed while detection was running.
+        self._keyword_jobs: dict[tuple[StreamKey, int], StreamContext] = {}
         self._segmenter_params = SegmenterParams(
             stable_n=settings.segmentation_stable_n,
             stable_ms=settings.segmentation_stable_ms,
@@ -561,6 +579,20 @@ class EngineCoordinator:
             suppress_model_init_output=settings.suppress_model_init_output,
             beam_size=settings.asr_beam_size,
         )
+
+        self.keyword_runtime: KeywordRuntime | None = None
+        if settings.keyword_enabled:
+            if not settings.keyword_model_path:
+                raise RuntimeError("KEYWORD_ENABLED=true requires KEYWORD_MODEL_PATH to be set")
+            self.keyword_runtime = KeywordRuntime(
+                model_path=settings.keyword_model_path,
+                device=settings.keyword_device,
+                threshold=settings.keyword_threshold,
+                topics=settings.keyword_topics,
+                queue_size=settings.keyword_queue_size,
+                result_callback=self._on_keyword_result_from_thread,
+                third_party_log_level=settings.third_party_log_level,
+            )
 
         self.translation_runtime: TranslationRuntimePool | None = None
         if settings.translation_enabled:
@@ -655,6 +687,8 @@ class EngineCoordinator:
         self._loop = asyncio.get_running_loop()
         timeout = self.settings.model_loading_timeout_s
         await asyncio.to_thread(self.runtime.start, timeout)
+        if self.keyword_runtime is not None:
+            await asyncio.to_thread(self.keyword_runtime.start, timeout)
         if self.translation_runtime is not None:
             await asyncio.to_thread(self.translation_runtime.start, timeout)
         if self.tts_runtime is not None:
@@ -683,6 +717,7 @@ class EngineCoordinator:
 
         self._dispatcher_tasks = [
             asyncio.create_task(self._runtime_dispatch_loop(), name="asr-result-dispatcher"),
+            asyncio.create_task(self._keyword_dispatch_loop(), name="keyword-result-dispatcher"),
             asyncio.create_task(
                 self._translation_dispatch_loop(), name="translation-result-dispatcher"
             ),
@@ -694,6 +729,8 @@ class EngineCoordinator:
             await self.cancel_rpc(rpc_id, "engine shutdown")
 
         pools: list[tuple[str, object]] = [("ASR", self.runtime)]
+        if self.keyword_runtime is not None:
+            pools.append(("Keyword", self.keyword_runtime))
         if self.translation_runtime is not None:
             pools.append(("Translation", self.translation_runtime))
         if self.tts_runtime is not None:
@@ -744,6 +781,24 @@ class EngineCoordinator:
             loop.call_soon_threadsafe(_put)
         except RuntimeError:
             pass  # loop closed in narrow race during shutdown
+
+    def _on_keyword_result_from_thread(self, result: KeywordResult) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        def _put() -> None:
+            try:
+                self._keyword_results.put_nowait(result)
+            except asyncio.QueueFull:
+                logger.error("Keyword result queue full; dropping utterance=%s", result.utterance_id)
+                loop.call_soon_threadsafe(
+                    asyncio.ensure_future,
+                    self.fail_rpc(result.key.rpc_id, "INTERNAL", "keyword result queue full"),
+                )
+        try:
+            loop.call_soon_threadsafe(_put)
+        except RuntimeError:
+            pass
 
     def _on_translation_result_from_thread(self, result: TranslationResult) -> None:
         loop = self._loop
@@ -1076,6 +1131,10 @@ class EngineCoordinator:
 
         if stream is None:
             task = normalize_task(raw_task or None)
+            if task == TASK_KEYWORD and self.keyword_runtime is None:
+                raise FeatureUnavailableError(
+                    "task='keyword' requires KEYWORD_ENABLED=true and a configured local keyword model"
+                )
             if task == TASK_REALTIME_TRANSLATION:
                 if self.translation_runtime is None or self.tts_runtime is None:
                     raise FeatureUnavailableError(
@@ -1306,6 +1365,9 @@ class EngineCoordinator:
         for key in [key for key in self._pipeline_order if key.rpc_id == rpc_id]:
             self._pipeline_order.pop(key, None)
             self._stream_seq.pop(key, None)
+        for job_key in [job_key for job_key in self._keyword_jobs if job_key[0].rpc_id == rpc_id]:
+            self._keyword_jobs.pop(job_key, None)
+            self._stream_seq.pop(job_key[0], None)
         rpc.pending_postprocess = 0
 
         rpc.response_buffer.close()
@@ -1737,6 +1799,17 @@ class EngineCoordinator:
             finally:
                 self._runtime_results.task_done()
 
+    async def _keyword_dispatch_loop(self) -> None:
+        while True:
+            result = await self._keyword_results.get()
+            try:
+                await self._handle_keyword_result(result)
+            except Exception:
+                STREAM_ERRORS.inc()
+                logger.exception("Failed to dispatch keyword/topic result")
+            finally:
+                self._keyword_results.task_done()
+
     async def _translation_dispatch_loop(self) -> None:
         while True:
             result = await self._translation_results.get()
@@ -1801,7 +1874,7 @@ class EngineCoordinator:
                 stt_commits = self._segment_update(stream.key, utt, result)
                 self._emit_stt_segments(stream, utt, stt_commits, result.confidence)
             if (text_changed or stt_commits) and (
-                utt.task == TASK_SPEECH_TO_TEXT
+                utt.task in (TASK_SPEECH_TO_TEXT, TASK_KEYWORD)
                 or (
                     self.settings.translate_emit_source_partials
                     and utt.source_language != "auto"
@@ -1819,7 +1892,7 @@ class EngineCoordinator:
                         language=utt.source_language,
                         confidence=result.confidence,
                     )
-                    if utt.task == TASK_SPEECH_TO_TEXT:
+                    if utt.task in (TASK_SPEECH_TO_TEXT, TASK_KEYWORD):
                         self._emit_stt(stream, **partial)
                     else:  # translate source partials (translate_emit_source_partials): not ordered
                         self._emit_recognition(**partial)
@@ -1909,6 +1982,26 @@ class EngineCoordinator:
                     )
                 else:
                     self._stt_utterance_done(stream, utt.utterance_id)
+            elif utt.task == TASK_KEYWORD:
+                if utt.latest_text.strip():
+                    # The FINAL (text + topic) goes out when the topic result comes back (_handle_keyword_result).
+                    await self._submit_keyword_detection(stream, utt, utt.latest_text, result.confidence)
+                else:
+                    # Empty ASR: nothing to classify. _emit_recognition skips the empty result
+                    # (EMPTY_RESULTS_SKIPPED) and the transcribe order moves on.
+                    self._emit_stt(
+                        stream,
+                        last=True,
+                        key=stream.key,
+                        utterance_id=utt.utterance_id,
+                        text=utt.latest_text,
+                        is_final=True,
+                        ts_start=utt.ts_start,
+                        ts_end=utt.ts_end,
+                        language=utt.source_language,
+                        confidence=result.confidence,
+                        wall_start=utt.wall_start,
+                    )
             elif not utt.target_language:
                 await self._passthrough_utterance(
                     stream,
@@ -2559,6 +2652,157 @@ class EngineCoordinator:
             await self._drain_tts_pending(order, key, rpc)
         else:
             order.tts_skip.add(slot)
+
+    async def _submit_keyword_detection(
+        self,
+        stream: StreamContext,
+        utt: UtteranceContext,
+        source_text: str,
+        asr_confidence: float,
+    ) -> None:
+        """Send the ASR-final text of a task=keyword utterance to KeywordRuntime.
+
+        The utterance's FINAL (text + topic_label/topic_score/topic_info) is emitted by _handle_keyword_result,
+        in utterance order through _emit_stt. When the runtime is unavailable or its queue is full the text is
+        emitted at once with TOPIC_UNKNOWN (same graceful degradation as translation).
+        """
+        if self.keyword_runtime is None:
+            raise FeatureUnavailableError("keyword runtime is unavailable")
+        rpc = self._rpcs.get(stream.key.rpc_id)
+        if rpc is None or rpc.cancelled:
+            return
+        if rpc.pending_postprocess >= self.settings.max_postprocess_pending_per_rpc:
+            await self.fail_rpc(
+                rpc.rpc_id,
+                "RESOURCE_EXHAUSTED",
+                "too many pending keyword/topic utterances",
+            )
+            return
+
+        job_key = (stream.key, utt.utterance_id)
+        job = KeywordJob(
+            key=stream.key,
+            utterance_id=utt.utterance_id,
+            source_text=source_text,
+            source_language=utt.source_language,
+            ts_start=utt.ts_start,
+            ts_end=utt.ts_end,
+            asr_confidence=_clamp_confidence(asr_confidence),
+            wall_start=utt.wall_start,
+        )
+        try:
+            status = self.keyword_runtime.try_submit_nowait(job)
+        except Exception:
+            logger.exception("Keyword try_submit_nowait raised unexpectedly; degrading")
+            status = SubmitStatus.OVERLOADED
+
+        if status is SubmitStatus.ACCEPTED:
+            self._keyword_jobs[job_key] = stream
+            rpc.pending_postprocess += 1
+            KEYWORD_JOBS.inc()
+            self._trace(
+                "KEYWORD_SUBMIT",
+                stream.key,
+                utt.utterance_id,
+                source_text=source_text,
+                source_language=utt.source_language,
+                pending_postprocess=rpc.pending_postprocess,
+                queue_depth=self._queue_depth(self.keyword_runtime),
+                t_ms=self._since(utt.wall_start),
+            )
+            return
+
+        KEYWORD_ERRORS.inc()
+        self._trace(
+            "DEGRADE",
+            stream.key,
+            utt.utterance_id,
+            level=logging.WARNING,
+            reason="keyword_queue_full",
+            text=source_text,
+            status=status.name,
+            queue_depth=self._queue_depth(self.keyword_runtime),
+        )
+        self._emit_keyword_final(stream, job, TopicLabel.UNKNOWN, "", 0.0)
+
+    def _emit_keyword_final(
+        self,
+        stream: StreamContext,
+        job: KeywordJob | KeywordResult,
+        topic_label: TopicLabel,
+        topic_info: str,
+        topic_score: float,
+    ) -> None:
+        KEYWORD_TOPICS.labels(topic=topic_label.name).inc()
+        self._emit_stt(
+            stream,
+            last=True,
+            key=job.key,
+            utterance_id=job.utterance_id,
+            text=job.source_text,
+            is_final=True,
+            ts_start=job.ts_start,
+            ts_end=job.ts_end,
+            language=job.source_language,
+            confidence=job.asr_confidence,
+            topic_label=int(topic_label),
+            topic_info=topic_info,
+            topic_score=topic_score,
+            wall_start=job.wall_start,
+        )
+
+    async def _handle_keyword_result(self, result: KeywordResult) -> None:
+        job_key = (result.key, result.utterance_id)
+        stream = self._keyword_jobs.pop(job_key, None)
+        if stream is None:
+            STALE_RESULTS.inc()
+            self._trace_stale("keyword", result.key, result.utterance_id, "job_gone")
+            return
+        rpc = self._rpcs.get(result.key.rpc_id)
+        if rpc is None or rpc.cancelled:
+            return
+        rpc.pending_postprocess = max(0, rpc.pending_postprocess - 1)
+        KEYWORD_LATENCY_MS.observe(result.latency_ms)
+        KEYWORD_QUEUE_WAIT_MS.observe(result.queue_ms)
+
+        if result.error:
+            KEYWORD_ERRORS.inc()
+            self._trace(
+                "DEGRADE",
+                result.key,
+                result.utterance_id,
+                level=logging.WARNING,
+                reason="keyword_error",
+                text=result.source_text,
+                error=result.error,
+            )
+            label, info, score = TopicLabel.UNKNOWN, "", 0.0
+        else:
+            label, info, score = result.topic_label, result.topic_info, result.topic_score
+            self._trace(
+                "KEYWORD",
+                result.key,
+                result.utterance_id,
+                text=result.source_text,
+                topic_label=label.name,
+                topic_info=info or None,
+                topic_score=round(score, 4),
+                latency_ms=round(result.latency_ms, 1),
+                queue_ms=round(result.queue_ms, 1),
+                t_ms=self._since(result.wall_start),
+            )
+        self._emit_keyword_final(stream, result, label, info, score)
+
+        if (
+            result.key not in self._streams
+            and result.key not in self._pipeline_jobs_count
+            and not self._keyword_pending(result.key)
+        ):
+            self._stream_seq.pop(result.key, None)
+        self._maybe_finish_rpc(rpc)
+
+    def _keyword_pending(self, key: StreamKey) -> bool:
+        return any(job_key[0] == key for job_key in self._keyword_jobs)
 
     async def _submit_translation_pipeline(
         self,
@@ -3387,6 +3631,9 @@ class EngineCoordinator:
         confidence: float = 0.0,
         audio_payload: bytes = b"",
         audio_pt: int = 0,
+        topic_label: int = 0,
+        topic_info: str = "",
+        topic_score: float = 0.0,
         wall_start: float = 0.0,
         commit_wall: float = 0.0,
         segment_idx: int | None = None,
@@ -3414,6 +3661,9 @@ class EngineCoordinator:
                     confidence=confidence,
                     audio_payload=audio_payload[offset : offset + chunk_bytes],
                     audio_pt=audio_pt,
+                    topic_label=topic_label if is_last else 0,
+                    topic_info=topic_info if is_last else "",
+                    topic_score=topic_score if is_last else 0.0,
                     wall_start=wall_start,
                     commit_wall=commit_wall,
                     segment_idx=segment_idx,
@@ -3456,6 +3706,9 @@ class EngineCoordinator:
             utterance_id=utterance_id,
             audio_payload=audio_payload,
             audio_pt=audio_pt,
+            topic_label=int(topic_label),
+            topic_info=topic_info,
+            topic_score=float(topic_score),
             speech_end_wall=speech_end_wall if audio_payload else 0.0,
             preproc_delay_s=preproc_delay_s,
         )
@@ -3503,7 +3756,7 @@ class EngineCoordinator:
             },
         )
         self._pipeline_order_cleanup(stream.key)
-        if stream.key not in self._pipeline_jobs_count:
+        if stream.key not in self._pipeline_jobs_count and not self._keyword_pending(stream.key):
             self._stream_seq.pop(stream.key, None)
         if rpc:
             self._maybe_finish_rpc(rpc)

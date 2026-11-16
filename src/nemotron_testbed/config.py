@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging as _logging
 import os
 import re
@@ -184,6 +185,29 @@ class _Cfg:
                 return val
             return str(val).strip().lower() in {"1", "true", "yes", "on"}
         return _env_bool(env_name, default)
+
+    def mapping(self, yaml_path: str, env_name: str) -> dict:
+        """Read a mapping from YAML, or a JSON object from an env var (keyword.topics / KEYWORD_TOPICS_JSON).
+
+        Absent or explicit YAML null -> {} (same as an unset env var).
+        """
+        val = self._get(yaml_path)
+        if val is not _MISSING:
+            if val is None:
+                return {}
+            if not isinstance(val, dict):
+                raise ValueError(f"Config {yaml_path!r}: expected mapping, got {type(val).__name__}")
+            return val
+        raw = os.getenv(env_name, "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{env_name} must be a JSON object") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{env_name} must be a JSON object")
+        return parsed
 
     def devices(
         self,
@@ -497,6 +521,64 @@ def _build_trace_pcap(cfg: _Cfg) -> TracePcapSettings:
     return settings
 
 
+# ── Keyword / topic detection ─────────────────────────────────────────────────
+
+_KEYWORD_DEVICE_RE = re.compile(r"^(cpu|cuda|cuda:\d+)$")
+
+
+def _parse_keyword_topics(raw_topics: dict) -> dict[str, dict[str, list[str]]]:
+    """Validate keyword.topics: LABEL -> [examples] or LABEL -> {topic_info: [examples]}.
+
+    LABEL must be a TopicLabel name (WEATHER, FOOD, ...; not UNKNOWN), case-insensitive.
+    A plain list becomes {"": examples} (empty topic_info).
+    """
+    from .domain import TopicLabel  # lazy: keeps `import config` free of numpy for tools
+
+    allowed = [t.name for t in TopicLabel if t is not TopicLabel.UNKNOWN]
+    topics: dict[str, dict[str, list[str]]] = {}
+    for raw_label, raw_value in raw_topics.items():
+        label = str(raw_label).strip().upper()
+        if not label:
+            raise ValueError("keyword.topics contains an empty topic label")
+        if label not in allowed:
+            raise ValueError(
+                f"keyword.topics label {label!r} is not a TopicLabel; allowed: {', '.join(allowed)} "
+                "(a new label needs proto/speech.proto TopicLabel + domain.TopicLabel)"
+            )
+        if label in topics:
+            raise ValueError(f"keyword.topics label {label!r} is defined twice")
+
+        if isinstance(raw_value, list):
+            examples = [str(item).strip() for item in raw_value if str(item).strip()]
+            if not examples:
+                raise ValueError(f"keyword.topics.{label} must contain at least one non-empty example")
+            topics[label] = {"": examples}
+            continue
+
+        if not isinstance(raw_value, dict):
+            raise ValueError(
+                f"keyword.topics.{label} must be a list or mapping of topic_info to examples"
+            )
+
+        infos: dict[str, list[str]] = {}
+        for raw_info, raw_examples in raw_value.items():
+            info = str(raw_info).strip()
+            if not info:
+                raise ValueError(f"keyword.topics.{label} contains an empty topic_info")
+            if not isinstance(raw_examples, list):
+                raise ValueError(f"keyword.topics.{label}.{info} must be a list of example sentences")
+            examples = [str(item).strip() for item in raw_examples if str(item).strip()]
+            if not examples:
+                raise ValueError(
+                    f"keyword.topics.{label}.{info} must contain at least one non-empty example"
+                )
+            infos[info] = examples
+        if not infos:
+            raise ValueError(f"keyword.topics.{label} has no topic_info entries")
+        topics[label] = infos
+    return topics
+
+
 # ── Settings dataclass ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
@@ -647,6 +729,14 @@ class Settings:
     audio_preprocessing: AudioPreprocessSettings = field(default_factory=AudioPreprocessSettings)
     # Trace pcap (default = off)
     trace_pcap: TracePcapSettings = field(default_factory=TracePcapSettings)
+    # Keyword / semantic topic detection on ASR-final text (task=keyword; default = off)
+    keyword_enabled: bool = False
+    keyword_model_path: str | None = None
+    keyword_threshold: float = 0.75
+    keyword_device: str = "cpu"
+    keyword_queue_size: int = 64
+    # LABEL (TopicLabel name) -> topic_info -> example sentences; "" topic_info for a plain list
+    keyword_topics: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     # Warnings found while reading the config (deprecated YAML paths); main.py logs them
     config_warnings: tuple[str, ...] = ()
 
@@ -1057,6 +1147,31 @@ class Settings:
             raise ValueError(f"translation.intra_threads must be >= 1, got {translation_intra_threads}")
 
         # ------------------------------------------------------------------
+        # Keyword / semantic topic detection (task=keyword)
+        # ------------------------------------------------------------------
+        keyword_enabled = cfg.bool("keyword.enabled", "KEYWORD_ENABLED", False)
+        keyword_model_path = cfg.str("keyword.model_path", "KEYWORD_MODEL_PATH", "") or None
+        keyword_threshold = cfg.float("keyword.threshold", "KEYWORD_THRESHOLD", 0.75)
+        if not (-1.0 <= keyword_threshold <= 1.0):
+            raise ValueError(f"keyword.threshold must be between -1 and 1, got {keyword_threshold}")
+        keyword_device = cfg.str("keyword.device", "KEYWORD_DEVICE", "cpu")
+        if not _KEYWORD_DEVICE_RE.match(keyword_device.lower()):
+            raise ValueError(f"keyword.device must be cpu, cuda or cuda:N, got {keyword_device!r}")
+        keyword_queue_size = cfg.int("keyword.queue_size", "KEYWORD_QUEUE_SIZE", 64)
+        if keyword_queue_size < 1:
+            raise ValueError(f"keyword.queue_size must be >= 1, got {keyword_queue_size}")
+        keyword_topics = _parse_keyword_topics(cfg.mapping("keyword.topics", "KEYWORD_TOPICS_JSON"))
+        if keyword_enabled:
+            if not keyword_model_path:
+                raise ValueError(
+                    "keyword.model_path (KEYWORD_MODEL_PATH) is required when keyword.enabled=true"
+                )
+            if not keyword_topics:
+                raise ValueError(
+                    "keyword.topics (or KEYWORD_TOPICS_JSON) is required when keyword.enabled=true"
+                )
+
+        # ------------------------------------------------------------------
         # TTS
         # ------------------------------------------------------------------
         tts_enabled = cfg.bool("tts.enabled", "TTS_ENABLED", True)
@@ -1324,5 +1439,11 @@ class Settings:
             tts_magpie_apply_tn=tts_magpie_apply_tn,
             audio_preprocessing=audio_preprocessing,
             trace_pcap=_build_trace_pcap(cfg),
+            keyword_enabled=keyword_enabled,
+            keyword_model_path=keyword_model_path,
+            keyword_threshold=keyword_threshold,
+            keyword_device=keyword_device,
+            keyword_queue_size=keyword_queue_size,
+            keyword_topics=keyword_topics,
             config_warnings=tuple(cfg.warnings),
         )

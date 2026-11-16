@@ -92,6 +92,10 @@ class JsonFormatter(logging.Formatter):
             "step_num",
             "confidence",
             "confidence_source",
+            # Keyword / topic detection (KEYWORD_SUBMIT / KEYWORD)
+            "topic_label",
+            "topic_info",
+            "topic_score",
             # VAD debug
             "vad_score",
             "vad_speech",
@@ -109,7 +113,7 @@ class JsonFormatter(logging.Formatter):
             "peak_dbfs",
             "sample_rate",
             "channels",
-            # Per-stage pipeline trace (ASR_FINAL / TRANSLATE_SUBMIT / TRANSLATE / ORDER_HOLD /
+            # Per-stage pipeline trace (ASR_FINAL / KEYWORD_SUBMIT / KEYWORD / TRANSLATE_SUBMIT / TRANSLATE / ORDER_HOLD /
             # TTS_SUBMIT / TTS_PHRASE / EMIT / DEGRADE / STALE, GRPC_OPEN / STREAM_OPEN /
             # VAD_START / VAD_END / GRPC_SENT / STREAM_CLOSE / GRPC_CALL_ENDED / GRPC_CANCEL / GRPC_CLOSE)
             "stage",

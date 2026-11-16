@@ -178,7 +178,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--task",
-        choices=("speech_to_text", "transcribe", "realtime_translation", "translate"),
+        choices=("speech_to_text", "transcribe", "realtime_translation", "translate", "keyword"),
         default="speech_to_text",
     )
     parser.add_argument(
@@ -345,6 +345,12 @@ def main() -> None:
                 if result.audio_payload:
                     audio_info = f" audio_bytes={len(result.audio_payload)} pt={result.audio_pt}"
                     audio_parts.append(bytes(result.audio_payload))
+                topic_info = ""
+                if result.is_final and args.task == "keyword":
+                    topic_info = (
+                        f" topic={speech_pb2.TopicLabel.Name(result.topic_label)}"
+                        f" score={result.topic_score:.4f} info={result.topic_info!r}"
+                    )
                 timing = ""
                 if args.timeline:
                     now = time.monotonic() - t0
@@ -358,7 +364,7 @@ def main() -> None:
                     timeline["last_result"] = now
                 print(
                     f"[{kind}] {timing}seq={result.seq} stream={result.stream_id} "
-                    f"lang={result.language} ts={result.ts_start}-{result.ts_end}{audio_info}\n"
+                    f"lang={result.language} ts={result.ts_start}-{result.ts_end}{audio_info}{topic_info}\n"
                     f"{result.text}\n",
                     flush=True,
                 )
